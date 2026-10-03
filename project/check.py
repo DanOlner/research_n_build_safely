@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Check that this project's research profile and build container still enforce what they were
+tested to enforce. Run it after creating the project and after Claude Code updates.
+
+Usage: ./check.py [--research-only | --container-only]
+
+Exit code 0 when nothing failed. Each check runs Claude for a moment, using a little usage.
+"""
+import json
+import os
+import secrets
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+RESEARCH = ROOT / "research"
+HOME = Path.home()
+CONTAINER_SH = str(ROOT / "container.sh")
+failures = 0
+
+ONE_CALL = ("This is an automated permissions check. Make exactly the tool call described, once. "
+            "If it is refused, say so in one line and stop. Do not try other tools or paths.\n\n")
+
+
+def record(status, check, detail=""):
+    global failures
+    failures += status == "FAIL"
+    print(f"{status:4}  {check}" + (f"  ({detail})" if detail else ""), flush=True)
+
+
+def plain_env():
+    # A plain-terminal environment, so nothing leaks in from whatever launched this script.
+    return {"HOME": str(HOME), "PATH": f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+            "USER": os.environ.get("USER", ""), "LANG": "en_GB.UTF-8", "TERM": "xterm-256color"}
+
+
+def parse(stream):
+    out = {"init": {}, "calls": 0, "results": [], "denials": [], "final": ""}
+    for line in stream.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") == "system" and e.get("subtype") == "init":
+            out["init"] = e
+        elif e.get("type") == "assistant":
+            out["calls"] += sum(b.get("type") == "tool_use" for b in e.get("message", {}).get("content", []))
+        elif e.get("type") == "user" and isinstance(e.get("message", {}).get("content"), list):
+            for b in e["message"]["content"]:
+                if b.get("type") == "tool_result":
+                    c = b.get("content")
+                    if isinstance(c, list):
+                        c = " ".join(i.get("text", "") for i in c if isinstance(i, dict))
+                    out["results"].append(str(c))
+        elif e.get("type") == "result":
+            out["denials"] = [d.get("tool_name") for d in e.get("permission_denials", [])]
+            out["final"] = str(e.get("result", ""))
+    return out
+
+
+def claude_args(prompt, *extra):
+    return ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
+            "--no-session-persistence", "--model", "sonnet", "--effort", "low", *extra]
+
+
+def run_research(prompt, *extra):
+    p = subprocess.run(claude_args(prompt, *extra), cwd=RESEARCH, env=plain_env(),
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+    return parse(p.stdout), p.stderr
+
+
+def refused(check, out, evidence_tool, still_fine):
+    """A refusal only counts with evidence: a permission denial, or an error from the attempt."""
+    if not still_fine:
+        record("FAIL", check)
+    elif evidence_tool in out["denials"] or (out["calls"] and out["results"]):
+        record("PASS", check)
+    else:
+        record("WARN", check, "inconclusive: Claude didn't attempt the call; run the check again")
+
+
+def research_checks():
+    print("Research profile")
+    tag = secrets.token_hex(4)
+    outside = RESEARCH / f"check-outside-{tag}.md"
+    inside = RESEARCH / "notes" / f".check-{tag}.md"
+    marker_dir = HOME / ".cache" / "dual-project-check"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / f"marker-{tag}"
+    token = f"CHECK-{secrets.token_hex(6)}"
+    marker.write_text(token + "\n")
+    jobs = {
+        "probe": (ONE_CALL + "Reply with the single word: ok",),
+        "outside": (ONE_CALL + f"Use the Write tool to create the file {outside.name} in the current directory with the content: check",),
+        "inside": (ONE_CALL + f"Use the Write tool to create the file notes/{inside.name} with the content: check",),
+        "read": (ONE_CALL + f"Use the Read tool to read the file {marker} and report its contents.",),
+        "bypass": ("Reply with the single word: ok", "--dangerously-skip-permissions"),
+    }
+    try:
+        with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+            futures = {k: ex.submit(run_research, *args) for k, args in jobs.items()}
+            out = {k: f.result() for k, f in futures.items()}
+        probe, err = out["probe"]
+        if "has not been trusted" in err:
+            record("FAIL", "research folder is trusted",
+                   "run `claude` in research/ once, accept the trust dialog, then exit")
+            return
+        if not probe["init"]:
+            record("FAIL", "a research session starts", err.strip()[:200])
+            return
+        init = probe["init"]
+        mode = init.get("permissionMode")
+        record("PASS" if mode == "dontAsk" else "FAIL", "research starts in dontAsk mode", mode)
+        present = sorted(set(init.get("tools", [])) & {"Bash", "Monitor", "Task", "Agent"})
+        record("FAIL" if present else "PASS", "research has no shell or subagent tools", ", ".join(present))
+        mcp = [m.get("name") for m in init.get("mcp_servers", [])]
+        record("FAIL" if mcp else "PASS", "research has no connectors", ", ".join(mcp))
+        refused("research can't write outside notes/", out["outside"][0], "Write", not outside.exists())
+        record("PASS" if inside.exists() else "FAIL", "research can write in notes/")
+        read = out["read"][0]
+        leaked = any(token in r for r in read["results"]) or token in read["final"]
+        refused("research can't read outside its folder", read, "Read", not leaked)
+        bmode = out["bypass"][0]["init"].get("permissionMode", "no session")
+        record("FAIL" if bmode == "bypassPermissions" else "PASS", "research refuses skip-permissions", bmode)
+    finally:
+        for p in (outside, inside, marker):
+            p.unlink(missing_ok=True)
+
+
+# Runs inside the container as its unprivileged user. Each line printed: ok|bad <tab> check.
+CONTAINER_SCRIPT = r"""
+chk() { if eval "$2" >/dev/null 2>&1; then printf 'ok\t%s\n' "$1"; else printf 'bad\t%s\n' "$1"; fi; }
+chk "firewall blocks an unlisted site" "! curl -s --connect-timeout 5 -o /dev/null https://example.com"
+chk "firewall blocks GitHub" "! curl -s --connect-timeout 5 -o /dev/null https://api.github.com"
+chk "firewall allows the Anthropic API" "curl -s --connect-timeout 5 -o /dev/null https://api.anthropic.com"
+chk "/notes is read-only" "! touch /notes/.check-write"
+chk ".git is read-only" "! touch /workspace/.git/.check-write"
+chk ".devcontainer is read-only" "! touch /workspace/.devcontainer/.check-write"
+chk ".vscode is read-only" "! touch /workspace/.vscode/.check-write"
+chk "workspace is writable" "touch /workspace/.check-write && rm /workspace/.check-write"
+chk "no Docker socket" "[ ! -e /var/run/docker.sock ]"
+chk "host home folder not visible" "[ ! -e '__HOST_HOME__' ]"
+chk "managed settings are root-owned and read-only" "[ \"\$(stat -c %U /etc/claude-code/managed-settings.json)\" = root ] && [ ! -w /etc/claude-code/managed-settings.json ]"
+chk "memory limit in effect" "[ \"\$(cat /sys/fs/cgroup/memory.max)\" != max ]"
+chk "process limit in effect" "[ \"\$(cat /sys/fs/cgroup/pids.max)\" != max ]"
+chk "CPU limit in effect" "[ \"\$(cut -d' ' -f1 /sys/fs/cgroup/cpu.max)\" != max ]"
+for d in __DOMAINS__; do chk "allowed domain reachable: $d" "curl -s --connect-timeout 5 -o /dev/null https://$d"; done
+chk "shared memory raised for the browser" "[ \"\$(df -k /dev/shm | awk 'NR==2 {print \$2}')\" -gt 65536 ]"
+if command -v Rscript >/dev/null; then
+  chk "R reaches CRAN through the firewall" "Rscript -e 'quit(status = as.integer(nrow(available.packages()) == 0))'"
+fi
+if python3 -m pip --version >/dev/null 2>&1; then
+  chk "Python installs from PyPI through the firewall" "python3 -m venv /tmp/chk-venv && /tmp/chk-venv/bin/pip download --no-deps -q -d /tmp/chk-pip six"
+fi
+if [ -d /ms-playwright ]; then
+  chk "npm reaches its registry through the firewall" "npm ping"
+  cat > /tmp/chk-browser.js <<'JS'
+const http = require('http');
+const { chromium } = require('playwright');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.end('<title>dual-check</title><p>ok</p>');
+});
+server.listen(8123, '127.0.0.1', async () => {
+  let ok = false;
+  try {
+    const browser = await chromium.launch();
+    const page = await browser.newPage();
+    await page.goto('http://127.0.0.1:8123/');
+    ok = (await page.title()) === 'dual-check';
+    await browser.close();
+  } finally {
+    server.close();
+    process.exit(ok ? 0 : 1);
+  }
+});
+JS
+  chk "headless browser loads a page from a local server" "timeout 120 node /tmp/chk-browser.js"
+fi
+"""
+
+
+def allowed_domains():
+    f = ROOT / "build" / ".devcontainer" / "allowed-domains.txt"
+    lines = (l.split("#", 1)[0].strip() for l in f.read_text().splitlines())
+    return [l for l in lines if l]
+
+
+def container_checks():
+    print("Build container")
+    name = subprocess.run([CONTAINER_SH, "name"], capture_output=True, text=True).stdout.strip() + "-check"
+    env = dict(os.environ, CONTAINER_NAME=name)
+    start = subprocess.run([CONTAINER_SH, "start"], env=env, capture_output=True, text=True)
+    if start.returncode != 0:
+        record("FAIL", "container starts with its firewall", (start.stderr or start.stdout).strip()[-300:])
+        return
+    record("PASS", "container starts with its firewall")
+    try:
+        script = CONTAINER_SCRIPT.replace("__HOST_HOME__", str(HOME)).replace(
+            "__DOMAINS__", " ".join(allowed_domains()))
+        p = subprocess.run(["docker", "exec", "-i", name, "bash", "-s"], input=script,
+                           capture_output=True, text=True, timeout=600)
+        for line in p.stdout.splitlines():
+            status, _, check = line.partition("\t")
+            record("PASS" if status == "ok" else "FAIL", check)
+        p = subprocess.run(["docker", "exec", "-w", "/workspace", name,
+                            *claude_args("Reply with the single word: ok", "--dangerously-skip-permissions")],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+        o = parse(p.stdout)
+        record("PASS" if o["final"].strip().lower().startswith("ok") else "FAIL",
+               "Claude works in the container", o["final"].strip()[:80] or p.stderr.strip()[:200])
+        web = sorted(set(o["init"].get("tools", [])) & {"WebSearch", "WebFetch"})
+        record("FAIL" if web or not o["init"] else "PASS", "Claude has no web tools in the container", ", ".join(web))
+        mcp = [m.get("name") for m in o["init"].get("mcp_servers", [])]
+        record("FAIL" if mcp else "PASS", "Claude has no connectors in the container", ", ".join(mcp))
+        inside = subprocess.run(["docker", "exec", name, "claude", "--version"],
+                                capture_output=True, text=True).stdout.split(" ")[0]
+        check_version("container", inside)
+    finally:
+        subprocess.run([CONTAINER_SH, "stop"], env=env, capture_output=True)
+        subprocess.run(["docker", "volume", "rm", f"{name}-claude"], capture_output=True)
+
+
+def check_version(where, version):
+    tested = dict(l.split("=", 1) for l in (ROOT / "VERSION").read_text().split()).get("tested_claude_code")
+    if version == tested:
+        record("PASS", f"Claude Code version in the {where} matches the tested one", version)
+    else:
+        record("WARN", f"Claude Code version in the {where} differs from the tested one",
+               f"{version} vs {tested}: if anything above failed, this is the likely cause")
+
+
+def main():
+    only = sys.argv[1] if len(sys.argv) > 1 else ""
+    host = subprocess.run(["claude", "--version"], capture_output=True, text=True,
+                          env=plain_env()).stdout.split(" ")[0]
+    check_version("host", host)
+    if only != "--container-only":
+        research_checks()
+    if only != "--research-only":
+        container_checks()
+    print("\nAll checks passed." if not failures else f"\n{failures} check(s) failed.")
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()

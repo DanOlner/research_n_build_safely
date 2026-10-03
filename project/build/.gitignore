@@ -1,0 +1,21 @@
+# What the build agent generates that doesn't belong in the repository: installed packages,
+# caches and test reports. A plain `git status` doesn't show these, so review the agent's work
+# with `git status --ignored`, which does.
+#
+# Not listed on purpose: .env, .Renviron, .Rprofile and .RData. They change how code runs on
+# your machine, so they should show up in a plain `git status`.
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+
+# R
+.Rhistory
+.Rproj.user/
+
+# Node.js and Playwright
+node_modules/
+test-results/
+playwright-report/

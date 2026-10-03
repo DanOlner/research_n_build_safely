@@ -1,0 +1,54 @@
+#!/bin/bash
+# Create a new research + build project from the dual-project template.
+# Usage: new-dual-project [--with r,python,web] <new-project-folder>
+#   --with  language stacks for the build container (default: r). Each stack installs its tools
+#           in the image and opens the firewall to its package hosts; nothing else is opened.
+set -euo pipefail
+
+TEMPLATE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/project"
+usage() { echo "usage: new-dual-project [--with r,python,web] <new-project-folder>" >&2; exit 1; }
+
+stacks="r"
+target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --with) [ $# -ge 2 ] || usage; stacks="$2"; shift 2 ;;
+    --with=*) stacks="${1#--with=}"; shift ;;
+    -*) usage ;;
+    *) [ -z "$target" ] || usage; target="$1"; shift ;;
+  esac
+done
+[ -n "$target" ] || usage
+for s in ${stacks//,/ }; do
+  case "$s" in r|python|web) ;; *) echo "Unknown stack '$s'. Choose from: r, python, web." >&2; exit 1 ;; esac
+done
+[ -e "$target" ] && { echo "$target already exists; choose a new folder." >&2; exit 1; }
+
+mkdir -p "$target"
+target="$(cd "$target" && pwd)"
+cp -a "$TEMPLATE/." "$target/"
+name="$(basename "$target")"
+sed -i "s/^# PROJECT_NAME$/# $name/" "$target/README.md" "$target/build/README.md"
+
+# Switch each stack on or off in the image and in the firewall's domain list, together.
+dockerfile="$target/build/.devcontainer/Dockerfile"
+domains="$target/build/.devcontainer/allowed-domains.txt"
+for s in r python web; do
+  if [[ ",$stacks," == *",$s,"* ]]; then on=true; else on=false; fi
+  arg="INSTALL_$(echo "$s" | tr '[:lower:]' '[:upper:]')"
+  sed -i "s/^ARG $arg=.*/ARG $arg=$on/" "$dockerfile"
+  [ "$on" = true ] || sed -i "/# stack:$s\$/s/^\([^#]\)/# \1/" "$domains"
+done
+echo "stacks=${stacks// /}" >> "$target/VERSION"
+
+git -C "$target/build" init -q
+chmod +x "$target/container.sh" "$target/check.py"
+
+echo "Created $target with stacks: $stacks"
+echo
+echo "Next steps (details in $target/README.md):"
+[ -f "$HOME/.config/claude-container/token.env" ] ||
+  echo "  0. Save a container login token: see 'First-time setup' in the README"
+echo "  1. cd $target/research && claude     accept the trust dialog, then type /exit"
+echo "  2. cd $target && ./container.sh build"
+echo "  3. ./check.py                        every line should say PASS"

@@ -1,0 +1,20 @@
+# Extra domains the build container may reach, one per line. The Anthropic API is always allowed.
+# This file is copied into the image when it is built, so rebuild the container after changing it.
+# It can only be changed on the host: .devcontainer/ is read-only inside the container.
+# Lines tagged "stack:" are switched on or off by new-dual-project's --with option.
+
+# R packages from CRAN
+cloud.r-project.org            # stack:r
+
+# Python packages from PyPI (download only; publishing uses a different host, which stays blocked)
+pypi.org                       # stack:python
+files.pythonhosted.org         # stack:python
+
+# npm packages. This host also accepts package publishing from anyone holding an account's
+# credentials, so it's only switched on for web projects.
+registry.npmjs.org             # stack:web
+
+# Uncomment if you open the container with VS Code's Dev Containers extension:
+# update.code.visualstudio.com
+# marketplace.visualstudio.com
+# vscode.blob.core.windows.net

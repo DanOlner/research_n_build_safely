@@ -24,9 +24,11 @@ my-project/
   VERSION            template version and the Claude Code version it was tested with
   container.sh       start, use and stop the build container
   check.py           smoke test: run after setup and after Claude Code updates
+  pdf-text           text copies of the PDFs in research/sources/
   research/
     .claude/settings.json   the research profile: no shell, writes only to notes/, no skip-permissions
     CLAUDE.md
+    sources/         PDFs you add, and their text copies; not visible to the container
     notes/           mounted read-only into the container at /notes
   build/             the git repository you push
     CLAUDE.md

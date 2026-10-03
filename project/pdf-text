@@ -1,0 +1,73 @@
+#!/bin/bash
+# Make a text copy of each new or changed PDF in research/sources/ (report.pdf -> report.txt,
+# next to it), so research sessions can search documents and re-read them cheaply.
+#
+#   ./pdf-text
+#
+# Needs pdftotext from poppler-utils (sudo apt install poppler-utils). Copies keep the page
+# layout, and each page starts with a "--- PDF page N ---" line. Scanned pages have no text to
+# copy; Claude can read those from the PDF itself. To redo a copy, delete the .txt and run this
+# again.
+#
+# This script lives outside research/ and build/ on purpose: nothing the host runs should live
+# where an agent can write.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SOURCES="$ROOT/research/sources"
+
+command -v pdftotext >/dev/null || { echo "pdftotext not found: sudo apt install poppler-utils" >&2; exit 1; }
+[ -d "$SOURCES" ] || { echo "No folder $SOURCES" >&2; exit 1; }
+
+errlog="$(mktemp)"
+part=""
+trap 'rm -f "$errlog" ${part:+"$part"}' EXIT
+
+converted=0 current=0 failed=0
+while IFS= read -r -d '' pdf; do
+  txt="${pdf%.*}.txt"
+  name="${pdf#"$SOURCES"/}"
+  if [ -f "$txt" ] && [ "$txt" -nt "$pdf" ]; then
+    current=$((current + 1))
+    continue
+  fi
+  part="$txt.part"
+  # pdftotext ends every page with a form feed, so each record is one page. Start each with a
+  # numbered page line, and count the pages with (almost) no text.
+  if counts="$(pdftotext -layout -enc UTF-8 "$pdf" - 2>"$errlog" | awk -v out="$part" '
+      BEGIN { RS = "\f" }
+      { page[NR] = $0 }
+      END {
+        printf "" > out
+        n = NR
+        for (i = 1; i <= n; i++) {
+          printf "--- PDF page %d ---\n%s\n", i, page[i] > out
+          t = page[i]
+          gsub(/[[:space:]]/, "", t)
+          if (length(t) < 10) empty++
+        }
+        print n, empty + 0
+      }')"; then
+    mv "$part" "$txt"
+    read -r pages empty <<<"$counts"
+    unit="pages"
+    [ "$pages" -eq 1 ] && unit="page"
+    note=""
+    [ "$empty" -gt 0 ] && note=", $empty with little or no text: blank or scanned"
+    echo "Converted  $name ($pages $unit$note)"
+    converted=$((converted + 1))
+  else
+    rm -f "$part"
+    reason="$(grep -v '^$' "$errlog" | tail -n 1)"
+    echo "Failed     $name: ${reason:-pdftotext error}"
+    failed=$((failed + 1))
+  fi
+  part=""
+done < <(find "$SOURCES" -iname '*.pdf' \( -type f -o -type l \) -print0 | sort -z)
+
+if [ $((converted + current + failed)) -eq 0 ]; then
+  echo "No PDFs in research/sources/"
+else
+  echo "$converted converted, $current already up to date, $failed failed"
+fi
+[ "$failed" -eq 0 ]

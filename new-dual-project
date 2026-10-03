@@ -42,7 +42,7 @@ done
 echo "stacks=${stacks// /}" >> "$target/VERSION"
 
 git -C "$target/build" init -q
-chmod +x "$target/container.sh" "$target/check.py"
+chmod +x "$target/container.sh" "$target/check.py" "$target/pdf-text"
 
 echo "Created $target with stacks: $stacks"
 echo

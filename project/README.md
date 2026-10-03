@@ -2,10 +2,10 @@
 
 A two-part Claude project, made from the dual-project template (version in `VERSION`).
 
-- **`research/`**: Claude searches and reads the web on your machine and writes notes into `research/notes/`. It can't run commands, read outside its folder, or write outside `notes/`.
+- **`research/`**: on your machine, Claude searches and reads the web and any documents you put in `research/sources/`, and writes notes into `research/notes/`. It can't run commands, read outside its folder, or write outside `notes/`.
 - **`build/`**: Claude works on the project inside a Docker container with permission checks skipped. It reads the notes at `/notes`, read-only. `build/` is the git repository you push.
 
-`container.sh` and `check.py` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
+`container.sh`, `check.py` and `pdf-text` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
 
 The build container's language stacks are listed in `VERSION` (`stacks=`). See "Language stacks" below.
 
@@ -58,6 +58,26 @@ git -C build reset --hard && git -C build clean -ffdx
 ```
 
 Push from your machine as usual.
+
+## Working with PDFs
+
+Copy PDFs into `research/sources/` (subfolders are fine), then make text copies of the new ones:
+
+```
+./pdf-text
+```
+
+It writes `report.txt` next to each new or changed `report.pdf`, starting each page with a `--- PDF page N ---` line so Claude can cite pages. Research sessions search and read the text copies, which is exact and cheap. They open a PDF itself for charts, tables the copy garbles, and scanned pages, which have no text to copy. `./pdf-text` says how many pages in each document have little or no text. To redo a copy, delete the `.txt` and run it again.
+
+`./pdf-text` and Claude's own PDF reading both need poppler-utils, once per machine: `sudo apt install poppler-utils`.
+
+`sources/` stays on the research side: the build container sees only `notes/`. Claude can't write in `sources/`, so what it learns from the documents goes into `notes/`.
+
+**Confidential documents.** A PDF can hide instructions, as a web page can, and research sessions can fetch any website. For confidential documents, start research without web tools, so a session has no tool for sending their contents to a website:
+
+```
+cd research && claude --disallowedTools WebFetch WebSearch
+```
 
 ## Changing what the container can reach
 

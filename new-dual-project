@@ -41,7 +41,8 @@ for s in r python web; do
 done
 echo "stacks=${stacks// /}" >> "$target/VERSION"
 
-git -C "$target/build" init -q
+# The whole project folder is one git repository: research notes and build code together.
+git -C "$target" init -q
 chmod +x "$target/container.sh" "$target/check.py" "$target/pdf-text"
 
 echo "Created $target with stacks: $stacks"
@@ -52,3 +53,4 @@ echo "Next steps (details in $target/README.md):"
 echo "  1. cd $target/research && claude     accept the trust dialog, then type /exit"
 echo "  2. cd $target && ./container.sh build"
 echo "  3. ./check.py                        every line should say PASS"
+echo "  4. git add -A && git commit -m \"New project\"   your restore point before the build agent runs"

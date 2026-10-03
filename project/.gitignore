@@ -1,0 +1,9 @@
+# The project folder is one git repository: research notes, build code and these scripts.
+# build/.gitignore covers what the build agent generates.
+
+# Documents added for research: usually copyrighted, and soon too big to keep in git.
+/research/sources/*
+!/research/sources/.gitkeep
+
+# Claude Code's personal settings, if any get created.
+/research/.claude/settings.local.json

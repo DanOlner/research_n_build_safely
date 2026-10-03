@@ -5,6 +5,8 @@
 #   - no outbound SSH (port 22) to arbitrary hosts
 #   - no outbound connections to the Docker host network; inbound from the host is still accepted
 #   - IPv6 is dropped entirely, so enabling IPv6 on the Docker network can't bypass these rules
+#   - addresses shared between domains are added once, and each lookup is tried three times, so
+#     neither stops the container starting
 # Outbound DNS is unchanged: Docker's resolver needs it, and DNS queries can still carry data out.
 # Closing that needs a filtering DNS resolver, which this script doesn't provide.
 set -euo pipefail  # Exit on error, undefined vars, and pipeline failures
@@ -63,7 +65,12 @@ fi
 
 for domain in "${domains[@]}"; do
     echo "Resolving $domain..."
-    ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
+    ips=""
+    for attempt in 1 2 3; do
+        ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}') || true
+        [ -n "$ips" ] && break
+        [ "$attempt" -lt 3 ] && { echo "No answer for $domain, retrying..."; sleep 2; }
+    done
     if [ -z "$ips" ]; then
         echo "ERROR: Failed to resolve $domain"
         exit 1

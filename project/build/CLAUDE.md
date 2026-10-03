@@ -9,4 +9,4 @@ You run in a container with permission checks skipped. Research notes are in `/n
   - Python from PyPI, into a virtual environment: `python3 -m venv .venv`, then `.venv/bin/pip install ...`.
   - npm packages from the npm registry.
 - For web work, if Playwright is installed (version 1.63.0, with headless Chromium): serve the site locally inside the container and test it with Playwright scripts, taking screenshots to check the result. If the project uses `@playwright/test`, pin it to 1.63.0; other versions try to download a browser, which the firewall blocks.
-- Don't try to commit, push, or change `.git`, `.devcontainer` or `.vscode`. They're read-only here; the user commits and pushes from the host.
+- Version control happens on the host: there's no git repository in here, and `/workspace/.git` is a read-only placeholder. Don't create a repository anywhere in the workspace, and don't try to change `.devcontainer`, `.vscode` or `.claude`, which are read-only too. The user commits and pushes from the host.

@@ -3,7 +3,9 @@
 A two-part Claude project, made from the dual-project template (version in `VERSION`).
 
 - **`research/`**: on your machine, Claude searches and reads the web and any documents you put in `research/sources/`, and writes notes into `research/notes/`. It can't run commands, read outside its folder, or write outside `notes/`.
-- **`build/`**: Claude works on the project inside a Docker container with permission checks skipped. It reads the notes at `/notes`, read-only. `build/` is the git repository you push.
+- **`build/`**: Claude works on the project inside a Docker container with permission checks skipped. It reads the notes at `/notes`, read-only.
+
+This whole folder is one git repository, which you push: research notes, build code and these scripts, but not the documents in `research/sources/`. The build container never sees the repository. Once the container has run, empty `build/.git` and `build/.claude` folders owned by root appear. They're placeholders that stop the agent creating a repository or Claude Code settings there, and git ignores them.
 
 `container.sh`, `check.py` and `pdf-text` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
 
@@ -11,7 +13,7 @@ The build container's language stacks are listed in `VERSION` (`stacks=`). See "
 
 ## First-time setup
 
-1. **Trust the research folder.** Run `cd research && claude`, accept the trust dialog, then type `/exit`. Until you do, the research settings' allow rules are ignored.
+1. **Trust the project.** Run `cd research && claude`, accept the trust dialog, then type `/exit`. Until you do, the research settings' allow rules are ignored. Claude Code trusts a whole git repository at once, so this covers the project folder, `build/` included. That's why you should never start Claude Code on your machine inside `build/` (see "What isn't covered").
 2. **Container login** (once per machine). If `~/.config/claude-container/token.env` doesn't exist yet, run `claude setup-token`, then:
    ```
    mkdir -p -m 700 ~/.config/claude-container
@@ -19,6 +21,7 @@ The build container's language stacks are listed in `VERSION` (`stacks=`). See "
    ```
 3. **Build the container image**: `./container.sh build`. The first build takes several minutes.
 4. **Check everything**: `./check.py`. Every line should say PASS.
+5. **Make the first commit**: `git add -A && git commit -m "New project"`. It's your restore point before the build agent runs.
 
 ## Everyday use
 
@@ -34,14 +37,14 @@ cd research && claude
 ./container.sh claude
 ```
 
-**Before leaving the build agent to run on its own**, commit your work in `build/` on your machine. Afterwards, check what the agent changed before you commit or run anything it wrote:
+**Before leaving the build agent to run on its own**, commit your work: `git add -A && git commit`. Afterwards, check what changed before you commit or run anything the agent wrote. In this folder, run:
 
 ```
-git -C build status --ignored
-git -C build diff
+git status --ignored
+git diff
 ```
 
-The first lists every file and folder the agent added, changed or deleted. It also lists what `build/.gitignore` hides from a plain `git status`, such as `.venv/` and `node_modules/`, though not what changed inside them. The second shows the changes inside files you'd already committed. It doesn't show new files, so open those yourself. Pay most attention to:
+The first lists every file and folder that was added, changed or deleted: by the build agent in `build/`, and by research in `research/notes/`. It also lists what the `.gitignore` files hide from a plain `git status`, such as `.venv/`, `node_modules/` and the documents in `research/sources/`, though not what changed inside them. The second shows the changes inside files you'd already committed. It doesn't show new files, so open those yourself. Pay most attention to:
 
 - R scripts, `.Rprofile`, `.Renviron` and `.RData`
 - Python scripts, `setup.py` and `pyproject.toml`
@@ -51,11 +54,13 @@ The first lists every file and folder the agent added, changed or deleted. It al
 
 To run one of its R scripts on your machine, use `Rscript --vanilla script.R`, which skips the project's R startup files. Keep Python and npm dependencies in the container: installing them on your machine runs code from those packages, and the agent can change anything in its own `.venv` and `node_modules`, so don't use those on your machine either.
 
-To throw away everything the agent did since your last commit, including ignored files such as `.venv/` and any git repositories it created inside `build/`:
+To throw away everything the build agent did since your last commit, including ignored files such as `.venv/` and any git repositories it created inside `build/`, while leaving research alone:
 
 ```
-git -C build reset --hard && git -C build clean -ffdx
+git restore --source=HEAD --staged --worktree -- build && git clean -ffdx -- build
 ```
+
+Keep the `-- build` on both. `git reset --hard` would also throw away uncommitted research notes, and `git clean -ffdx` without `-- build` would delete your PDFs in `research/sources/`.
 
 Push from your machine as usual.
 
@@ -71,7 +76,7 @@ It writes `report.txt` next to each new or changed `report.pdf`, starting each p
 
 `./pdf-text` and Claude's own PDF reading both need poppler-utils, once per machine: `sudo apt install poppler-utils`.
 
-`sources/` stays on the research side: the build container sees only `notes/`. Claude can't write in `sources/`, so what it learns from the documents goes into `notes/`.
+`sources/` stays on the research side: the build container sees only `notes/`. Git ignores it too, since journal articles are usually copyrighted and PDFs soon get too big for a repository. Claude can't write in `sources/`, so what it learns from the documents goes into `notes/`, which is committed.
 
 **Confidential documents.** A PDF can hide instructions, as a web page can, and research sessions can fetch any website. For confidential documents, start research without web tools, so a session has no tool for sending their contents to a website:
 
@@ -113,6 +118,7 @@ Run `./check.py`. Claude Code updates itself on your machine. The container's co
 
 ## What isn't covered
 
+- Claude Code sessions on your machine. Never start one inside `build/` or its subfolders: the trust you gave the project covers them, and the agent can write Claude Code settings in subfolders, including hooks that run commands. A session started elsewhere that reads files in `build/` also reads the agent's `build/CLAUDE.md`, so weigh its suggestions as you would the agent's code.
 - DNS lookups from the container aren't filtered.
 - The container's login token is visible to the agent. It can only reach the Anthropic API and the allowed domains, and it can only make model requests.
 - Research fetches can reach any website.

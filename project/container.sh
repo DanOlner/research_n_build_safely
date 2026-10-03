@@ -54,13 +54,19 @@ firewall() {
 start() {
   if running; then echo "$NAME is already running."; return; fi
   [ -f "$TOKEN_FILE" ] || { echo "Missing $TOKEN_FILE. See 'Container login' in README.md." >&2; exit 1; }
-  for d in research/notes build/.git build/.devcontainer build/.vscode; do
+  for d in research/notes build/.devcontainer build/.vscode; do
     [ -d "$ROOT/$d" ] || { echo "Missing $ROOT/$d" >&2; exit 1; }
   done
   docker image inspect "$IMAGE" >/dev/null 2>&1 || build
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   local ports=() p
   for p in $PUBLISH_PORTS; do ports+=(-p "127.0.0.1:$p:$p"); done
+  # The git repository is the whole project folder, which the container never sees.
+  # /workspace/.git and /workspace/.claude are empty read-only placeholders, so the agent can't
+  # create a repository in build/ that git on the host would then use, or Claude Code settings
+  # (which can define hooks) that a session on the host would load. The trust you give the
+  # project covers build/ too. Docker leaves empty root-owned build/.git and build/.claude
+  # folders on the host as the mount points; git ignores them.
   docker run -d --name "$NAME" --hostname "$NAME" \
     --cap-add=NET_ADMIN --cap-add=NET_RAW \
     --env-file "$TOKEN_FILE" \
@@ -70,7 +76,8 @@ start() {
     -e CLAUDE_CONFIG_DIR=/home/node/.claude \
     --mount type=bind,source="$ROOT/build",target=/workspace \
     --mount type=bind,source="$ROOT/research/notes",target=/notes,readonly \
-    --mount type=bind,source="$ROOT/build/.git",target=/workspace/.git,readonly \
+    --mount type=tmpfs,target=/workspace/.git,readonly \
+    --mount type=tmpfs,target=/workspace/.claude,readonly \
     --mount type=bind,source="$ROOT/build/.devcontainer",target=/workspace/.devcontainer,readonly \
     --mount type=bind,source="$ROOT/build/.vscode",target=/workspace/.vscode,readonly \
     -w /workspace -u node "$IMAGE" sleep infinity >/dev/null

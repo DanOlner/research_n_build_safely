@@ -50,7 +50,8 @@
     "source=claude-code-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
     "source=claude-code-config-${devcontainerId},target=/home/node/.claude,type=volume",
     "source=${localWorkspaceFolder}/../research/notes,target=/notes,type=bind,readonly",
-    "source=${localWorkspaceFolder}/.git,target=/workspace/.git,type=bind,readonly",
+    "type=tmpfs,target=/workspace/.git,readonly",
+    "type=tmpfs,target=/workspace/.claude,readonly",
     "source=${localWorkspaceFolder}/.devcontainer,target=/workspace/.devcontainer,type=bind,readonly",
     "source=${localWorkspaceFolder}/.vscode,target=/workspace/.vscode,type=bind,readonly"
   ],

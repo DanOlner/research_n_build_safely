@@ -42,7 +42,7 @@ my-project/          one git repository: what you commit and push
 
 Research side:
 
-- No shell, subagent or connector tools.
+- No shell or subagent tools. Your claude.ai connectors (Gmail, Drive and so on) aren't loaded, and connector tools are denied as a second layer.
 - Reads limited to the folder; writes only to `notes/`.
 - Starts in `dontAsk` mode, and refuses skip-permissions and auto mode.
 - No git status snapshot in its sessions, so it never sees the names of files the build agent creates.

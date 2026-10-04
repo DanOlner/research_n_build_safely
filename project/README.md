@@ -108,13 +108,13 @@ Chosen when the project was created (`new-dual-project --with r,python,web`). Ea
 
 The npm registry also accepts package publishing from anyone holding an account's credentials, which is why only web projects open it.
 
-**Viewing a dev server in your own browser** is off by default. To turn it on, set `PUBLISH_PORTS="5173"` at the top of `container.sh`, start the dev server with `--host 0.0.0.0`, then run `./container.sh stop` and `start`. The port is reachable only from your machine. But opening pages the agent wrote in your own browser runs its code on your machine, outside the container's firewall. Review the code first, or use a separate browser profile.
+**Viewing a dev server in your own browser** is off by default. To turn it on, put the ports in the `PUBLISH_PORTS` line near the top of `container.sh`, for example `PUBLISH_PORTS="${PUBLISH_PORTS-8000 8001}"`. Then run `./container.sh stop` and `./container.sh claude --continue`. The agent sees the list as `$PUBLISH_PORTS`, and is told to serve on `0.0.0.0` on one of those ports, so you open `http://localhost:8000`. The ports are reachable only from your machine. But opening pages the agent wrote in your own browser runs its code on your machine, outside the container's firewall. Review the code first, or use a separate browser profile.
 
 **Adding a stack later:** in `build/.devcontainer/`, set its `ARG INSTALL_...=true` line in `Dockerfile` and uncomment its lines in `allowed-domains.txt`. Then run `./container.sh rebuild` and add it to `stacks=` in `VERSION`.
 
 ## After Claude Code updates
 
-Run `./check.py`. Claude Code updates itself on your machine. The container's copy is fixed when the image is built; `./container.sh rebuild` updates it.
+Run `./check.py`. Claude Code updates itself on your machine. The container's copy is fixed when the image is built: `./container.sh rebuild` installs the version your machine has, then restarts the container. If both halves pass, set `tested_claude_code` in `VERSION` to the new version.
 
 ## What isn't covered
 

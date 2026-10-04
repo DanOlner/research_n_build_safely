@@ -209,7 +209,8 @@ def allowed_domains():
 def container_checks():
     print("Build container")
     name = subprocess.run([CONTAINER_SH, "name"], capture_output=True, text=True).stdout.strip() + "-check"
-    env = dict(os.environ, CONTAINER_NAME=name)
+    # No published ports: the project's own container may be running and holding them.
+    env = dict(os.environ, CONTAINER_NAME=name, PUBLISH_PORTS="")
     start = subprocess.run([CONTAINER_SH, "start"], env=env, capture_output=True, text=True)
     if start.returncode != 0:
         record("FAIL", "container starts with its firewall", (start.stderr or start.stdout).strip()[-300:])

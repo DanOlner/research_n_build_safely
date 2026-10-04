@@ -1,5 +1,6 @@
 {
   "includeGitInstructions": false,
+  "disableClaudeAiConnectors": true,
   "permissions": {
     "defaultMode": "dontAsk",
     "disableBypassPermissionsMode": "disable",

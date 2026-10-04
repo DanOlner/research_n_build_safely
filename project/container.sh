@@ -28,16 +28,23 @@ MEMORY=8g
 PIDS=1024
 SHM=1g
 
-# Ports to make reachable from your own machine, on localhost only, e.g. PUBLISH_PORTS="5173".
-# Off by default: opening pages the agent wrote in your own browser runs its code on your
-# machine, outside the container's firewall. The dev server must listen on 0.0.0.0 inside.
-# Changing this needs ./container.sh stop, then start.
-PUBLISH_PORTS="${PUBLISH_PORTS:-}"
+# Ports to make reachable from your own machine, on localhost only: put them after the "-",
+# e.g. PUBLISH_PORTS="${PUBLISH_PORTS-8000 8001}". Off by default: opening pages the agent wrote
+# in your own browser runs its code on your machine, outside the container's firewall. The
+# agent sees the list as $PUBLISH_PORTS, and its server must listen on 0.0.0.0 inside.
+# Changing this needs ./container.sh stop, then start. check.py runs its own container with
+# PUBLISH_PORTS set empty, so the two don't compete for the same ports.
+PUBLISH_PORTS="${PUBLISH_PORTS-}"
 
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = "true" ]; }
 
 build() {
-  docker build -t "$IMAGE" --build-arg TZ="${TZ:-Europe/London}" "$ROOT/build/.devcontainer"
+  # Install the same Claude Code version as on this machine. A new version also makes Docker redo
+  # that step, rather than reusing a cached install of "latest".
+  local version
+  version="$(claude --version 2>/dev/null | cut -d' ' -f1)"
+  docker build -t "$IMAGE" --build-arg TZ="${TZ:-Europe/London}" \
+    --build-arg CLAUDE_CODE_VERSION="${version:-latest}" "$ROOT/build/.devcontainer"
 }
 
 firewall() {
@@ -70,6 +77,7 @@ start() {
   docker run -d --name "$NAME" --hostname "$NAME" \
     --cap-add=NET_ADMIN --cap-add=NET_RAW \
     --env-file "$TOKEN_FILE" \
+    -e PUBLISH_PORTS="$PUBLISH_PORTS" \
     --cpus="$CPUS" --memory="$MEMORY" --pids-limit="$PIDS" --shm-size="$SHM" \
     "${ports[@]}" \
     --mount type=volume,source="$NAME-claude",target=/home/node/.claude \

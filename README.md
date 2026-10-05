@@ -21,11 +21,12 @@ Each stack installs its tools in the image and opens the firewall to its package
 ```
 my-project/          one git repository: what you commit and push
   README.md          everyday use
-  VERSION            template version and the Claude Code version it was tested with
+  VERSION            template version, and the Claude Code versions that passed the checks
   .gitignore         keeps the documents in research/sources/ out of git
   container.sh       start, use and stop the build container
-  check.py           smoke test: run after setup and after Claude Code updates
+  check.py           the safety checks: run after setup; they rerun by themselves after updates
   pdf-text           text copies of the PDFs in research/sources/
+  research-gate      reruns the research checks after Claude Code updates (called by research's hooks)
   research/
     .claude/settings.json   the research profile: no shell, writes only to notes/, no skip-permissions
     CLAUDE.md
@@ -46,6 +47,7 @@ Research side:
 - Reads limited to the folder; writes only to `notes/`.
 - Starts in `dontAsk` mode, and refuses skip-permissions and auto mode.
 - No git status snapshot in its sessions, so it never sees the names of files the build agent creates.
+- After a Claude Code update, the research checks run once when a session starts, and research is paused if they fail.
 
 Build container:
 
@@ -53,10 +55,11 @@ Build container:
 - No web tools, enforced by root-owned managed settings.
 - `/notes`, `.devcontainer` and `.vscode` are read-only.
 - No git repository: the project's repository stays on the host. `/workspace/.git` and `/workspace/.claude` are empty read-only placeholders, so the agent can't create a repository, or Claude Code settings with hooks, where host tools would pick them up.
-
-Claude Code trusts a whole git repository at once, so trusting a project covers `build/`. Never start Claude Code on your machine inside `build/`.
 - No access to your home folder or to Docker.
 - CPU, memory and process limits.
+- When the image gets a new Claude Code version, the container checks run before Claude starts in it.
+
+Claude Code trusts a whole git repository at once, so trusting a project covers `build/`. Never start Claude Code on your machine inside `build/`.
 
 ## Updating the template
 

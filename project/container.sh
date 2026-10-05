@@ -1,9 +1,11 @@
 #!/bin/bash
 # Start, use and stop this project's build container from the host.
 #
-#   ./container.sh build      build the image (the first build takes several minutes)
+#   ./container.sh build      build the image (the first build takes several minutes), then run
+#                             the container checks if its Claude Code version hasn't passed them
 #   ./container.sh start      start the container and apply its firewall
-#   ./container.sh claude     run Claude in the container, with permission checks skipped
+#   ./container.sh claude     run Claude in the container, with permission checks skipped; first
+#                             runs the container checks if they haven't passed on this version
 #   ./container.sh shell      open a shell in the container
 #   ./container.sh firewall   re-apply the firewall, refreshing the allowed sites' addresses
 #   ./container.sh stop       stop and remove the container (the image and Claude's history are kept)
@@ -44,7 +46,39 @@ build() {
   local version
   version="$(claude --version 2>/dev/null | cut -d' ' -f1)"
   docker build -t "$IMAGE" --build-arg TZ="${TZ:-Europe/London}" \
-    --build-arg CLAUDE_CODE_VERSION="${version:-latest}" "$ROOT/build/.devcontainer"
+    --build-arg CLAUDE_CODE_VERSION="${version:-latest}" \
+    --label claude_code_version="${version:-latest}" "$ROOT/build/.devcontainer"
+  ensure_checked
+}
+
+# The Claude Code version in the image: from the label build() adds, or by asking the image.
+image_version() {
+  local version
+  version="$(docker image inspect -f '{{index .Config.Labels "claude_code_version"}}' "$IMAGE" 2>/dev/null || true)"
+  case "$version" in
+    [0-9]*) echo "$version" ;;
+    *) docker run --rm --entrypoint claude "$IMAGE" --version 2>/dev/null | cut -d' ' -f1 ;;
+  esac
+}
+
+# Run the container checks once for each Claude Code version the image gets, and refuse to run
+# Claude on a version that hasn't passed them.
+ensure_checked() {
+  local version tested
+  version="$(image_version)"
+  tested="$(sed -n 's/^tested_container=//p' "$ROOT/VERSION")"
+  tested="${tested:-$(sed -n 's/^tested_claude_code=//p' "$ROOT/VERSION")}"
+  if [ -n "$version" ] && [ "$version" = "$tested" ]; then return 0; fi
+  echo "The image has Claude Code ${version:-of an unknown version}, which the container checks haven't passed yet (they last passed on ${tested:-no version}), so they're running once now: it takes about 20 seconds and a little of your usage, and makes sure the new version keeps the container's restrictions in place."
+  if "$ROOT/check.py" --container-only --auto; then return 0; fi
+  echo "The container checks didn't all pass, so Claude won't be started in this container. Fix the cause, then run ./check.py --container-only --accept." >&2
+  return 1
+}
+
+# Say so when the running container is older than the current image.
+note_old_image() {
+  [ "$(docker inspect -f '{{.Image}}' "$NAME")" = "$(docker image inspect -f '{{.Id}}' "$IMAGE")" ] ||
+    echo "This container started before the image was last rebuilt. To use the new image, exit Claude, then run ./container.sh stop and ./container.sh claude."
 }
 
 firewall() {
@@ -102,12 +136,16 @@ cmd="${1:-help}"
 case "$cmd" in
   build) build ;;
   start) start ;;
-  claude) running || start; docker exec -it -w /workspace "$NAME" claude --dangerously-skip-permissions "$@" ;;
+  claude)
+    running || start
+    ensure_checked || exit 1
+    note_old_image
+    docker exec -it -w /workspace "$NAME" claude --dangerously-skip-permissions "$@" ;;
   shell) running || start; docker exec -it -w /workspace "$NAME" zsh ;;
   firewall) running || { echo "$NAME is not running." >&2; exit 1; }; firewall ;;
   stop) stop ;;
   rebuild) stop; build; start ;;
   status) if running; then echo "$NAME is running."; else echo "$NAME is not running."; fi ;;
   name) echo "$NAME" ;;
-  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

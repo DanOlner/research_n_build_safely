@@ -7,3 +7,8 @@
 
 # Claude Code's personal settings, if any get created.
 /research/.claude/settings.local.json
+
+# research-gate's state: a failed or unfinished automatic check, and the lock that stops two
+# research sessions running the checks at once.
+/.research-check-failed
+/.research-check.lock

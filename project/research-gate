@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Runs research's safety checks automatically after Claude Code updates. Research's settings
+call it from two hooks:
+
+  research-gate start    when a research session starts: if this Claude Code version hasn't
+                         passed the research checks, run them once (about 10 seconds) and record
+                         the result in VERSION
+  research-gate prompt   before each prompt: refuse it while the checks are failing or unfinished
+
+It lives in the project's top folder, outside research/ and build/, so neither agent can change it.
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+# First line "unfinished <version>" while a check runs, "failed <version>" after one fails.
+FAILED = ROOT / ".research-check-failed"
+LOCK = ROOT / ".research-check.lock"
+REFUSED = "Prompts are refused until ./check.py --research-only --accept passes in the project folder."
+
+
+def say(**fields):
+    print(json.dumps(fields))
+
+
+def tested():
+    recorded = dict(l.split("=", 1) for l in (ROOT / "VERSION").read_text().split() if "=" in l)
+    return recorded.get("tested_research") or recorded.get("tested_claude_code")
+
+
+def marker():
+    """(state, version, details) from the marker file, or None when there isn't one."""
+    try:
+        first, _, details = FAILED.read_text().partition("\n")
+    except FileNotFoundError:
+        return None
+    state, _, version = first.partition(" ")
+    return state, version, details.strip()
+
+
+def start():
+    version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.split(" ")[0]
+    with open(LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # a second session waits here for a check already running
+        previous, state = tested(), marker()
+        if version == previous and state is None:
+            return
+        if state and state[0] == "failed" and state[1] == version:
+            say(systemMessage=f"Research is paused: a safety check didn't pass on Claude Code {version} "
+                              f"({state[2]}). {REFUSED}")
+            return
+        FAILED.write_text(f"unfinished {version}\n")
+        p = subprocess.run([str(ROOT / "check.py"), "--research-only", "--auto"],
+                           capture_output=True, text=True)
+        problems = "; ".join(problem(l) for l in p.stdout.splitlines() if l.startswith(("FAIL", "WARN")))
+        if p.returncode == 0:
+            FAILED.unlink(missing_ok=True)
+            say(systemMessage=f"Claude Code updated from {previous} to {version}, so research's safety "
+                              "checks ran once before this session started (about 10 seconds) to make sure "
+                              "the update hasn't loosened its restrictions: all passed.")
+        elif p.returncode == 2:
+            FAILED.unlink(missing_ok=True)
+            say(systemMessage=f"Claude Code updated to {version}, but one of research's safety checks was "
+                              f"inconclusive ({problems}), so they'll run again next time you start research.")
+        else:
+            FAILED.write_text(f"failed {version}\n{problems or 'see ./check.py --research-only'}\n")
+            say(systemMessage=f"Research is paused: Claude Code updated to {version} and a safety check "
+                              f"didn't pass ({problems}). {REFUSED}")
+
+
+def problem(line):
+    """'FAIL  name  (detail)' from check.py becomes 'name: detail'."""
+    name, _, detail = line.split(None, 1)[1].partition("  (")
+    return f"{name}: {detail[:-1]}" if detail else name
+
+
+def prompt():
+    state = marker()
+    if state is None:
+        return
+    status, version, details = state
+    if status == "unfinished":
+        reason = ("Research's safety checks for this Claude Code version haven't finished. If no other "
+                  "research session is running them, exit and start research again to run them.")
+    else:
+        reason = f"Research is paused: a safety check didn't pass on Claude Code {version} ({details}). {REFUSED}"
+    say(decision="block", reason=reason)
+
+
+if __name__ == "__main__":
+    if os.environ.get("DUAL_PROJECT_CHECK"):
+        sys.exit(0)  # a session check.py started, as part of a check that's already running
+    {"start": start, "prompt": prompt}[sys.argv[1]]()

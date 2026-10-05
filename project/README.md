@@ -7,7 +7,7 @@ A two-part Claude project, made from the dual-project template (version in `VERS
 
 This whole folder is one git repository, which you push: research notes, build code and these scripts, but not the documents in `research/sources/`. The build container never sees the repository. Once the container has run, empty `build/.git` and `build/.claude` folders owned by root appear. They're placeholders that stop the agent creating a repository or Claude Code settings there, and git ignores them.
 
-`container.sh`, `check.py` and `pdf-text` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
+`container.sh`, `check.py`, `pdf-text` and `research-gate` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
 
 The build container's language stacks are listed in `VERSION` (`stacks=`). See "Language stacks" below.
 
@@ -114,7 +114,12 @@ The npm registry also accepts package publishing from anyone holding an account'
 
 ## After Claude Code updates
 
-Run `./check.py`. Claude Code updates itself on your machine. The container's copy is fixed when the image is built: `./container.sh rebuild` installs the version your machine has, then restarts the container. If both halves pass, set `tested_claude_code` in `VERSION` to the new version.
+The safety checks run by themselves when Claude Code's version changes, and each side refuses to run on a version that hasn't passed them:
+
+- **Research:** when a research session starts on a new version, `research-gate` runs the research checks first. That adds about 10 seconds, once per update, plus a little of your usage, and a one-line message says why. If they pass, the version is recorded and research carries on. If a check fails, or research has gained a tool it didn't have before, research is paused, and every prompt is refused until `./check.py --research-only --accept` passes.
+- **Container:** its Claude Code only changes when you rebuild. `./container.sh rebuild` installs the version your machine has, then restarts the container. `build`, `rebuild` and `claude` run the container checks when the image has a version that hasn't passed them, taking about 20 seconds. If the checks fail, Claude isn't started in the container.
+
+`VERSION` records what passed: `tested_research`, `tested_container` and research's accepted tool list. To check by hand, run `./check.py`. Add `--accept` to record the result, once you've read any warnings.
 
 ## What isn't covered
 

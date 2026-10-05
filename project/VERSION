@@ -1,3 +1,5 @@
-template_version=1.5
-template_date=2026-10-04
-tested_claude_code=2.1.289
+template_version=1.6
+template_date=2026-10-05
+tested_research=2.1.289
+tested_container=2.1.289
+research_tools=CronDelete,CronList,DesignSync,Edit,EnterWorktree,ExitWorktree,Glob,Grep,ListAgents,NotebookEdit,PushNotification,Read,ReportFindings,ScheduleWakeup,TaskStop,ToolSearch,WebFetch,WebSearch,Write

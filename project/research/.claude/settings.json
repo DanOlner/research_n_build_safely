@@ -28,5 +28,30 @@
       "Read(~/.aws/**)",
       "Read(~/.config/**)"
     ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/../research-gate start",
+            "timeout": 300,
+            "statusMessage": "Checking that this Claude Code version keeps research's restrictions in place (after an update this runs once and takes about 10 seconds)"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/../research-gate prompt",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
   }
 }

@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """Check that this project's research profile and build container still enforce what they were
-tested to enforce. Run it after creating the project and after Claude Code updates.
+tested to enforce. It also runs by itself after Claude Code updates: research-gate runs the
+research half when a research session starts on a new version, and container.sh runs the
+container half when the image has a new version.
 
-Usage: ./check.py [--research-only | --container-only]
+Usage: ./check.py [--research-only | --container-only] [--accept | --auto]
+
+  --accept  if nothing failed, record the versions checked, and research's tool list, in VERSION,
+            so the automatic checks treat them as tested. Use it once you've read any warnings.
+  --auto    what the automatic checks use: record only if everything passed with no warnings.
+            Exit code 1 if anything failed or research gained tools, 2 if a check was inconclusive.
 
 Exit code 0 when nothing failed. Each check runs Claude for a moment, using a little usage.
 """
+import argparse
 import json
 import os
 import secrets
@@ -18,22 +26,47 @@ ROOT = Path(__file__).resolve().parent
 RESEARCH = ROOT / "research"
 HOME = Path.home()
 CONTAINER_SH = str(ROOT / "container.sh")
+VERSION_FILE = ROOT / "VERSION"
+# Written by research-gate when the automatic research checks fail; cleared here once they pass.
+RESEARCH_FAILED = ROOT / ".research-check-failed"
 failures = 0
+attention = 0      # warnings a person needs to look at: research has gained tools
+inconclusive = 0   # warnings where Claude didn't attempt the call; running again usually settles it
 
 ONE_CALL = ("This is an automated permissions check. Make exactly the tool call described, once. "
             "If it is refused, say so in one line and stop. Do not try other tools or paths.\n\n")
 
 
-def record(status, check, detail=""):
-    global failures
+def record(status, check, detail="", kind=None):
+    global failures, attention, inconclusive
     failures += status == "FAIL"
+    attention += kind == "attention"
+    inconclusive += kind == "inconclusive"
     print(f"{status:4}  {check}" + (f"  ({detail})" if detail else ""), flush=True)
 
 
 def plain_env():
     # A plain-terminal environment, so nothing leaks in from whatever launched this script.
+    # DUAL_PROJECT_CHECK tells research-gate not to start another check from inside this one.
     return {"HOME": str(HOME), "PATH": f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin",
-            "USER": os.environ.get("USER", ""), "LANG": "en_GB.UTF-8", "TERM": "xterm-256color"}
+            "USER": os.environ.get("USER", ""), "LANG": "en_GB.UTF-8", "TERM": "xterm-256color",
+            "DUAL_PROJECT_CHECK": "1"}
+
+
+def read_version():
+    return dict(l.split("=", 1) for l in VERSION_FILE.read_text().split() if "=" in l)
+
+
+def write_version(updates):
+    lines = VERSION_FILE.read_text().splitlines()
+    keys = [l.split("=", 1)[0] for l in lines]
+    for key, value in updates.items():
+        if key in keys:
+            lines[keys.index(key)] = f"{key}={value}"
+        else:
+            lines.append(f"{key}={value}")
+            keys.append(key)
+    VERSION_FILE.write_text("\n".join(lines) + "\n")
 
 
 def parse(stream):
@@ -78,11 +111,17 @@ def refused(check, out, evidence_tool, still_fine):
     elif evidence_tool in out["denials"] or (out["calls"] and out["results"]):
         record("PASS", check)
     else:
-        record("WARN", check, "inconclusive: Claude didn't attempt the call; run the check again")
+        record("WARN", check, "inconclusive: Claude didn't attempt the call; run the check again",
+               kind="inconclusive")
 
 
 def research_checks():
+    """Returns what --accept or --auto would record: the version checked and research's tools."""
     print("Research profile")
+    found = {}
+    host = subprocess.run(["claude", "--version"], capture_output=True, text=True,
+                          env=plain_env()).stdout.split(" ")[0]
+    check_version("host", host, "tested_research")
     tag = secrets.token_hex(4)
     outside = RESEARCH / f"check-outside-{tag}.md"
     inside = RESEARCH / "notes" / f".check-{tag}.md"
@@ -116,10 +155,10 @@ def research_checks():
         if "has not been trusted" in err:
             record("FAIL", "research folder is trusted",
                    "run `claude` in research/ once, accept the trust dialog, then exit")
-            return
+            return found
         if not probe["init"]:
             record("FAIL", "a research session starts", err.strip()[:200])
-            return
+            return found
         init = probe["init"]
         mode = init.get("permissionMode")
         record("PASS" if mode == "dontAsk" else "FAIL", "research starts in dontAsk mode", mode)
@@ -140,9 +179,23 @@ def research_checks():
         snapshot = out["snapshot"][0]["final"]
         record("FAIL" if snapshot_file.name in snapshot else "PASS",
                "research sessions get no git status snapshot")
+        # A tool research didn't have when the list was last accepted needs a person to look at it.
+        tools = sorted(init.get("tools", []))
+        accepted = [t for t in read_version().get("research_tools", "").split(",") if t]
+        new = sorted(set(tools) - set(accepted))
+        if not accepted:
+            record("WARN", "research has no tools beyond the accepted list", "no list recorded yet",
+                   kind="attention")
+        elif new:
+            record("WARN", "research has no tools beyond the accepted list", f"new: {', '.join(new)}",
+                   kind="attention")
+        else:
+            record("PASS", "research has no tools beyond the accepted list")
+        found = {"tested_research": host, "research_tools": ",".join(tools)}
     finally:
         for p in (outside, inside, marker, snapshot_file, build_file):
             p.unlink(missing_ok=True)
+    return found
 
 
 # Runs inside the container as its unprivileged user. Each line printed: ok|bad <tab> check.
@@ -207,14 +260,16 @@ def allowed_domains():
 
 
 def container_checks():
+    """Returns what --accept or --auto would record: the Claude Code version in the image."""
     print("Build container")
+    found = {}
     name = subprocess.run([CONTAINER_SH, "name"], capture_output=True, text=True).stdout.strip() + "-check"
     # No published ports: the project's own container may be running and holding them.
     env = dict(os.environ, CONTAINER_NAME=name, PUBLISH_PORTS="")
     start = subprocess.run([CONTAINER_SH, "start"], env=env, capture_output=True, text=True)
     if start.returncode != 0:
         record("FAIL", "container starts with its firewall", (start.stderr or start.stdout).strip()[-300:])
-        return
+        return found
     record("PASS", "container starts with its firewall")
     try:
         script = CONTAINER_SCRIPT.replace("__HOST_HOME__", str(HOME)).replace(
@@ -236,32 +291,64 @@ def container_checks():
         record("FAIL" if mcp else "PASS", "Claude has no connectors in the container", ", ".join(mcp))
         inside = subprocess.run(["docker", "exec", name, "claude", "--version"],
                                 capture_output=True, text=True).stdout.split(" ")[0]
-        check_version("container", inside)
+        check_version("container", inside, "tested_container")
+        found = {"tested_container": inside}
     finally:
         subprocess.run([CONTAINER_SH, "stop"], env=env, capture_output=True)
         subprocess.run(["docker", "volume", "rm", f"{name}-claude"], capture_output=True)
+    return found
 
 
-def check_version(where, version):
-    tested = dict(l.split("=", 1) for l in (ROOT / "VERSION").read_text().split()).get("tested_claude_code")
+def check_version(where, version, key):
+    recorded = read_version()
+    tested = recorded.get(key) or recorded.get("tested_claude_code")
     if version == tested:
-        record("PASS", f"Claude Code version in the {where} matches the tested one", version)
+        record("PASS", f"Claude Code version in the {where} has passed these checks before", version)
     else:
-        record("WARN", f"Claude Code version in the {where} differs from the tested one",
-               f"{version} vs {tested}: if anything above failed, this is the likely cause")
+        record("NOTE", f"Claude Code version in the {where} is new to these checks",
+               f"{version}; last passed on {tested or 'none'}. If a check fails, the update is the likely cause")
+
+
+def settle(found, strict):
+    """Record what passed in VERSION. strict (--auto) also holds back on any warning."""
+    if failures or (strict and (attention or inconclusive)) or not found:
+        print("Nothing recorded: " + ("a check failed." if failures else
+                                      "a warning needs looking at." if attention else
+                                      "a check was inconclusive." if inconclusive else
+                                      "no checks ran."))
+        return
+    write_version(found)
+    if "tested_research" in found:
+        RESEARCH_FAILED.unlink(missing_ok=True)
+    print("Recorded as passed: " + ", ".join(f"{k}={v}" for k, v in found.items() if k != "research_tools")
+          + (" and research's tool list" if "research_tools" in found else "") + ".")
 
 
 def main():
-    only = sys.argv[1] if len(sys.argv) > 1 else ""
-    host = subprocess.run(["claude", "--version"], capture_output=True, text=True,
-                          env=plain_env()).stdout.split(" ")[0]
-    check_version("host", host)
-    if only != "--container-only":
-        research_checks()
-    if only != "--research-only":
-        container_checks()
+    ap = argparse.ArgumentParser(description="Check this project's research profile and build container.")
+    half = ap.add_mutually_exclusive_group()
+    half.add_argument("--research-only", action="store_true", help="only check the research profile")
+    half.add_argument("--container-only", action="store_true", help="only check the build container")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--accept", action="store_true",
+                      help="if nothing failed, record the versions and research's tools as checked")
+    mode.add_argument("--auto", action="store_true",
+                      help="record only if everything passed with no warnings (used by the automatic checks)")
+    args = ap.parse_args()
+    found = {}
+    if not args.container_only:
+        found.update(research_checks())
+    if not args.research_only:
+        found.update(container_checks())
     print("\nAll checks passed." if not failures else f"\n{failures} check(s) failed.")
-    sys.exit(1 if failures else 0)
+    if attention and not args.accept:
+        print("Research has tools it didn't have when its tool list was last accepted. Find out what "
+              "they do; if they're fine, run ./check.py --research-only --accept.")
+    if args.accept or args.auto:
+        settle(found, strict=args.auto)
+    if failures or (args.auto and attention):
+        sys.exit(1)
+    sys.exit(2 if args.auto and inconclusive else 0)
 
 
 if __name__ == "__main__":

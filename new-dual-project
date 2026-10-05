@@ -43,7 +43,7 @@ echo "stacks=${stacks// /}" >> "$target/VERSION"
 
 # The whole project folder is one git repository: research notes and build code together.
 git -C "$target" init -q
-chmod +x "$target/container.sh" "$target/check.py" "$target/pdf-text"
+chmod +x "$target/container.sh" "$target/check.py" "$target/pdf-text" "$target/research-gate"
 
 echo "Created $target with stacks: $stacks"
 echo

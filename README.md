@@ -27,6 +27,7 @@ my-project/          one git repository: what you commit and push
   check.py           the safety checks: run after setup; they rerun by themselves after updates
   pdf-text           text copies of the PDFs in research/sources/
   research-gate      reruns the research checks after Claude Code updates (called by research's hooks)
+  commit-check       git pre-commit hook: refuses commits that add an Anthropic token or API key
   research/
     .claude/settings.json   the research profile: no shell, writes only to notes/, no skip-permissions
     CLAUDE.md
@@ -58,6 +59,10 @@ Build container:
 - No access to your home folder or to Docker.
 - CPU, memory and process limits.
 - When the image gets a new Claude Code version, the container checks run before Claude starts in it.
+
+Your repository:
+
+- A git pre-commit hook refuses commits that add an Anthropic token or API key, such as the container's login token if the agent wrote it into a file. It catches only a credential written out in full.
 
 Claude Code trusts a whole git repository at once, so trusting a project covers `build/`. Never start Claude Code on your machine inside `build/`.
 

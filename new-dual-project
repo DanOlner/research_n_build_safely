@@ -43,7 +43,10 @@ echo "stacks=${stacks// /}" >> "$target/VERSION"
 
 # The whole project folder is one git repository: research notes and build code together.
 git -C "$target" init -q
-chmod +x "$target/container.sh" "$target/check.py" "$target/pdf-text" "$target/research-gate"
+# Refuses commits that add an Anthropic token or API key. A link rather than a copy, so it always
+# runs the project's own commit-check.
+ln -s ../../commit-check "$target/.git/hooks/pre-commit"
+chmod +x "$target/container.sh" "$target/check.py" "$target/pdf-text" "$target/research-gate" "$target/commit-check"
 
 echo "Created $target with stacks: $stacks"
 echo

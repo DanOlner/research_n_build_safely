@@ -7,7 +7,7 @@ A two-part Claude project, made from the dual-project template (version in `VERS
 
 This whole folder is one git repository, which you push: research notes, build code and these scripts, but not the documents in `research/sources/`. The build container never sees the repository. Once the container has run, empty `build/.git` and `build/.claude` folders owned by root appear. They're placeholders that stop the agent creating a repository or Claude Code settings there, and git ignores them.
 
-`container.sh`, `check.py`, `pdf-text` and `research-gate` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
+`container.sh`, `check.py`, `pdf-text`, `research-gate` and `commit-check` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
 
 The build container's language stacks are listed in `VERSION` (`stacks=`). See "Language stacks" below.
 
@@ -61,6 +61,8 @@ git restore --source=HEAD --staged --worktree -- build && git clean -ffdx -- bui
 ```
 
 Keep the `-- build` on both. `git reset --hard` would also throw away uncommitted research notes, and `git clean -ffdx` without `-- build` would delete your PDFs in `research/sources/`.
+
+**Tokens in commits.** A git hook, `commit-check`, refuses any commit that would add an Anthropic credential: the container's login token or an API key, which both start `sk-ant-`. It names the files and leaves fixing them to you. It only catches a credential written out in full, so an encoded copy gets past it, and it doesn't replace checking what changed. For a false alarm, `git commit --no-verify` skips it. Git doesn't copy hooks into clones, so in a new clone of this project, run `ln -s ../../commit-check .git/hooks/pre-commit` in its top folder. `./check.py` says if the hook is missing.
 
 Push from your machine as usual.
 
@@ -125,6 +127,6 @@ The safety checks run by themselves when Claude Code's version changes, and each
 
 - Claude Code sessions on your machine. Never start one inside `build/` or its subfolders: the trust you gave the project covers them, and the agent can write Claude Code settings in subfolders, including hooks that run commands. A session started elsewhere that reads files in `build/` also reads the agent's `build/CLAUDE.md`, so weigh its suggestions as you would the agent's code.
 - DNS lookups from the container aren't filtered.
-- The container's login token is visible to the agent. It can only reach the Anthropic API and the allowed domains, and it can only make model requests.
+- The container's login token is visible to the agent. It can only reach the Anthropic API and the allowed domains, and it can only make model requests. `commit-check` stops it being committed as plain text, but not encoded.
 - Research fetches can reach any website.
 - Opening `build/` with VS Code's Dev Containers extension uses `build/.devcontainer/devcontainer.json`. It mirrors `container.sh` but hasn't been tested, and may need the VS Code hosts uncommented in `allowed-domains.txt`.

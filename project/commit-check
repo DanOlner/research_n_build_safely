@@ -1,0 +1,35 @@
+#!/bin/bash
+# Git pre-commit hook: refuses a commit that adds an Anthropic credential, such as the container's
+# login token or an API key, to the repository. new-dual-project links it in as
+# .git/hooks/pre-commit. Git doesn't copy hooks into clones, so in a new clone run, in its top folder:
+#   ln -s ../../commit-check .git/hooks/pre-commit
+# It reads each staged file as git will store it, so .gitattributes can't hide a file from it.
+# It only catches a credential written out in full: an encoded copy, such as base64, gets past it.
+set -euo pipefail
+
+# Anthropic credentials start sk-ant-, then a type such as oat01- and the secret. The [-] stops
+# this file matching itself, and the length lets notes that only mention the prefix through.
+pattern='sk-ant[-][A-Za-z0-9_-]{20,}'
+
+# Compare with the last commit, or with an empty tree before the first one.
+against=$(git rev-parse --verify -q HEAD || git hash-object -t tree /dev/null)
+staged=$(mktemp)
+trap 'rm -f "$staged" "$staged.blob"' EXIT
+# One record per added or changed file: ":oldmode newmode oldsha newsha status", then its path.
+git diff-index --cached -z --no-renames --diff-filter=d "$against" > "$staged"
+
+found=()
+while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+  read -r _ mode _ sha _ <<< "$meta"
+  [ "$mode" = 160000 ] && continue   # a repository inside this one: git stores only its commit id
+  # The whole blob goes into a file first, so grep stopping early can't fail the read.
+  git cat-file blob "$sha" > "$staged.blob"
+  if LC_ALL=C grep -aqE "$pattern" "$staged.blob"; then found+=("$path"); fi
+done < "$staged"
+
+[ ${#found[@]} -eq 0 ] && exit 0
+# File names only: printing the matching lines would put the credential on screen.
+echo "Commit refused: these staged files contain what looks like an Anthropic token or API key:" >&2
+printf '  %s\n' "${found[@]}" >&2
+echo "Remove it from each file, stage them again, then commit." >&2
+exit 1

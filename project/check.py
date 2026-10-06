@@ -2,7 +2,8 @@
 """Check that this project's research profile and build container still enforce what they were
 tested to enforce. It also runs by itself after Claude Code updates: research-gate runs the
 research half when a research session starts on a new version, and container.sh runs the
-container half when the image has a new version.
+container half when the image has a new version. A full run also checks the git hook that keeps
+Anthropic tokens out of commits.
 
 Usage: ./check.py [--research-only | --container-only] [--accept | --auto]
 
@@ -19,6 +20,7 @@ import os
 import secrets
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -299,6 +301,36 @@ def container_checks():
     return found
 
 
+def git_checks():
+    """The pre-commit hook that refuses commits adding an Anthropic token: linked in, and working."""
+    print("Git hook")
+    git = lambda *a, **kw: subprocess.run(["git", "-C", str(ROOT), *a], capture_output=True, text=True, **kw)
+    hook = git("rev-parse", "--git-path", "hooks/pre-commit").stdout.strip()
+    if not hook:
+        record("FAIL", "project folder is a git repository", "run: git init")
+        return
+    hook, script = ROOT / hook, ROOT / "commit-check"
+    linked = hook.exists() and script.exists() and os.path.samefile(hook, script)
+    record("PASS" if linked else "FAIL", "pre-commit hook runs commit-check",
+           "" if linked else "in this folder, run: ln -s ../../commit-check .git/hooks/pre-commit")
+    if not linked:
+        return
+    # Stage a made-up token in a temporary index and object store, so the repository is untouched.
+    objects = ROOT / git("rev-parse", "--git-path", "objects").stdout.strip()
+    name = f"check-token-{secrets.token_hex(4)}.txt"
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, GIT_INDEX_FILE=f"{tmp}/index", GIT_OBJECT_DIRECTORY=f"{tmp}/objects",
+                   GIT_ALTERNATE_OBJECT_DIRECTORIES=str(objects))
+        os.mkdir(f"{tmp}/objects")
+        fake = "sk-ant-check01-" + secrets.token_urlsafe(30)
+        blob = git("hash-object", "-w", "--stdin", input=fake + "\n", env=env).stdout.strip()
+        git("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=env)
+        p = subprocess.run([str(hook)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+    ok = p.returncode == 1 and name in p.stderr
+    record("PASS" if ok else "FAIL", "pre-commit hook refuses a staged Anthropic token",
+           "" if ok else p.stderr.strip()[:200] or f"exit code {p.returncode}")
+
+
 def check_version(where, version, key):
     recorded = read_version()
     tested = recorded.get(key) or recorded.get("tested_claude_code")
@@ -336,6 +368,8 @@ def main():
                       help="record only if everything passed with no warnings (used by the automatic checks)")
     args = ap.parse_args()
     found = {}
+    if not (args.research_only or args.container_only):
+        git_checks()
     if not args.container_only:
         found.update(research_checks())
     if not args.research_only:

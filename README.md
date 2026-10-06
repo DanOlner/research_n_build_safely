@@ -61,6 +61,16 @@ Build container:
 
 Claude Code trusts a whole git repository at once, so trusting a project covers `build/`. Never start Claude Code on your machine inside `build/`.
 
+## Why two parts
+
+Most setups run one sandboxed agent that does everything, web research included. Anthropic's reference devcontainer and Trail of Bits' [claude-code-devcontainer](https://github.com/trailofbits/claude-code-devcontainer) both work that way. This template instead follows the advice to [split the work](https://martinfowler.com/articles/agentic-ai-security.html) so that no agent has the whole [lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/): private data, untrusted content, and a way to send data out. When this was checked in October 2026, no ready-made setup combined the two.
+
+- Research reads the web but can't run commands.
+- The build agent runs commands but has no web tools, can reach only the Anthropic API and package hosts, and has a login that only covers model requests.
+- Findings reach the build agent only through `notes/`, which you can read first.
+
+There are two costs. The build agent can't look things up mid-task, so research has to anticipate what it needs. And research is restricted by Claude Code's permission rules rather than by OS isolation, which is why its checks rerun after every update.
+
 ## Updating the template
 
 Projects are copies, so changes here don't reach existing projects. Each project's `VERSION` says which template version it came from.

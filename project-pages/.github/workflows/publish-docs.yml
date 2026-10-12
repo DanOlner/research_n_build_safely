@@ -1,0 +1,63 @@
+# Publishes build/docs/ to the project's GitHub Pages site.
+#
+# Why a workflow: this repository holds the whole project, the research and the build, so the
+# site is in build/docs/. GitHub Pages' "Deploy from a branch" setting can serve only the
+# repository root or a top-level /docs folder, so it can't point at build/docs. A workflow can
+# publish any folder. In the repository's Settings > Pages, set Source to "GitHub Actions".
+#
+# It publishes build/docs exactly as committed, and builds and runs nothing from the project: the
+# site is built in the build container, then you review and commit build/docs, and the push
+# publishes it. This file sits outside build/, so the build agent can't change what runs here
+# with permission to publish.
+
+name: Publish to GitHub Pages
+
+on:
+  push:
+    # new-dual-project set this to the branch git init created. Change it if you rename the branch.
+    branches: [DEFAULT_BRANCH]
+    paths:
+      - 'build/docs/**'
+      - '.github/workflows/publish-docs.yml'
+  # Lets you run it by hand from the Actions tab, e.g. for a first test.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer push waits rather than cancelling one in progress.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Each action is pinned to a commit, so a tag moved later can't change what runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the site
+        run: |
+          test -f build/docs/index.html || { echo "::error::build/docs/index.html (the site's front page) is missing"; exit 1; }
+          # The upload follows symbolic links, so one could publish files from elsewhere in the repository.
+          if find build/docs -type l | grep -q .; then
+            echo "::error::build/docs contains symbolic links, and the upload would publish what they point to. List them with: find build/docs -type l"
+            exit 1
+          fi
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: build/docs
+
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

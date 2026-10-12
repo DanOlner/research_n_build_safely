@@ -18,6 +18,8 @@ Each stack installs its tools in the image and opens the firewall to its package
 
 `--convos` also keeps research's and the build agent's conversations as readable Markdown, in `llm_convos/research/` and `llm_convos/build/`, using the [export_all_convos](https://github.com/DanOlner/export_all_convos) scripts. They're converted automatically: research's when a research session ends, and the build agent's when `./container.sh claude` exits. Each folder's `.gitignore` keeps its conversations out of git until you allow them one at a time. "Conversation records" in the new project's `README.md` has the rest.
 
+`--pages` publishes `build/docs/` as the repository's GitHub Pages site. Pages' simple *Deploy from a branch* setting can serve only the repository root or a top-level `/docs` folder, so a workflow at the top of the repository, `.github/workflows/publish-docs.yml`, publishes `build/docs` exactly as committed whenever a push changes it. It runs none of the project's code, sits where the build agent can't change it, and refuses symbolic links in `build/docs`, which the upload would follow. The build agent is told that `docs/` is the published site. "Publishing build/docs with GitHub Pages" in the new project's `README.md` has the one-time setting on GitHub.
+
 ## What a project contains
 
 ```
@@ -35,6 +37,7 @@ my-project/          one git repository: what you commit and push
   llm_convos/        with --convos: not visible to either agent
     research/        research's conversations as Markdown; its .gitignore keeps them out of git until allowed
     build/           the build agent's, the same way
+  .github/workflows/publish-docs.yml   with --pages: publishes build/docs/ to GitHub Pages
   research/
     .claude/settings.json   the research profile: no shell, writes only to notes/, no skip-permissions
     CLAUDE.md
@@ -71,6 +74,7 @@ Your repository:
 
 - A git pre-commit hook refuses commits that add an Anthropic token or API key, such as the container's login token if the agent wrote it into a file. It catches only a credential written out in full.
 - With `--convos`, the same hook refuses a conversation that its folder's `.gitignore` doesn't allow, and an allowed one that export_all_convos's scan finds a credential in, of any kind the scan knows.
+- With `--pages`, the workflow that publishes `build/docs/` is outside `build/`, so the agent can't change what runs on GitHub with permission to publish. It runs none of the project's code, refuses symbolic links in `build/docs/`, doesn't keep its checkout's credentials, and pins its actions to commits. What's in `build/docs/` becomes a public website when you push it, so it's yours to review first.
 
 Claude Code trusts a whole git repository at once, so trusting a project covers `build/`. Never start Claude Code on your machine inside `build/`.
 
@@ -88,12 +92,15 @@ There are two costs. The build agent can't look things up mid-task, so research 
 
 Projects are copies, so changes here don't reach existing projects. Each project's `VERSION` says which template version it came from.
 
-After changing anything in `project/` or `project-convos/`, create a throwaway project with `--convos`, run its `./check.py`, and raise `template_version` in `project/VERSION`.
+After changing anything in `project/`, `project-convos/` or `project-pages/`, create a throwaway project with `--convos --pages`, run its `./check.py`, and raise `template_version` in `project/VERSION`.
 
 `project-convos/` holds what `--convos` adds to a project. `new-dual-project` also adds a `SessionEnd` hook to research's settings, and keeps the README's "Conversation records" section, which sits between `<!-- convos -->` lines in `project/README.md`; without `--convos` it removes that section.
+
+`project-pages/` holds the workflow `--pages` adds. `new-dual-project` sets its `branches:` to the branch `git init` creates, and keeps the sections between `<!-- pages -->` lines in `project/README.md` and `project/build/CLAUDE.md`; without `--pages` it removes them. After changing the workflow, lint it with [actionlint](https://github.com/rhysd/actionlint), which can run in a throwaway container: `docker run --rm --network none -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:latest`, in the folder above `.github`.
 
 ## Where the files came from
 
 - **Container files:** Anthropic's reference devcontainer (`anthropics/claude-code`, `.devcontainer/`). The firewall changes are listed at the top of `init-firewall.sh`. Additions: the R, Python and web stacks, the domain list, managed settings, read-only mounts and resource limits.
 - **Research settings:** the hardened profile from testing.
 - **Conversation export scripts:** `project-convos/scripts/` is the `scripts/` folder of [export_all_convos](https://github.com/DanOlner/export_all_convos) at commit `3674d6d`, unchanged, and each `llm_convos/<side>/.gitignore` starts as its deny-all stub. To update them, copy a newer `scripts/` folder over it. `convos` uses `find_convo_dir` and `export_all_convos.py`'s `--convo-dir`, `--output-dir` and `--redact`, and `publish_convos.py`'s `read_entries` and `git_tracked`, so check those still exist.
+- **GitHub Pages workflow:** first written by the build agent in `~/claude/projects/modelling_firm_demand`, then reviewed and tightened: its actions pinned to commits (checkout v7.0.1, configure-pages v6.0.0, upload-pages-artifact v5.0.0 and deploy-pages v5.0.1, the latest in October 2026), the checkout's credentials not kept, the symbolic-link check added, and the branch set when the project is created.

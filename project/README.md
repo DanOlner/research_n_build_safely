@@ -11,6 +11,9 @@ This whole folder is one git repository, which you push: research notes, build c
 <!-- convos -->
 So do `convos` and `scripts/`, which keep the conversation records (see "Conversation records").
 <!-- /convos -->
+<!-- pages -->
+`.github/workflows/publish-docs.yml`, which publishes `build/docs/`, is up here too, out of the agent's reach (see "Publishing build/docs with GitHub Pages").
+<!-- /pages -->
 
 The build container's language stacks are listed in `VERSION` (`stacks=`). See "Language stacks" below.
 
@@ -69,6 +72,22 @@ Keep the `-- build` on both. `git reset --hard` would also throw away uncommitte
 
 Push from your machine as usual.
 
+<!-- pages -->
+## Publishing build/docs with GitHub Pages
+
+This project publishes `build/docs/` as its GitHub Pages site, at `https://<owner>.github.io/<repository>/` once it's set up. The build agent is told that `docs/` is the published site.
+
+GitHub Pages' simple *Deploy from a branch* setting can serve only the repository root or a top-level `/docs` folder, so it can't point at `build/docs`. Instead, the workflow `.github/workflows/publish-docs.yml` publishes `build/docs` exactly as committed whenever a push changes it. It builds nothing and runs none of the project's code, so the site is built in the container and committed. It sits outside `build/`, so the agent can't change what runs on GitHub. It stops without publishing if `build/docs/index.html` is missing, or if `build/docs` contains symbolic links, which the upload would follow to files elsewhere in the repository.
+
+**Setting it up (once):** push the repository to GitHub, then in its settings, under *Pages*, set *Source* to *GitHub Actions*. Test it by running *Publish to GitHub Pages* by hand from the *Actions* tab.
+
+**Updating the site:** ask the build agent to rebuild it into `build/docs/`, or build it yourself inside the container (`./container.sh shell`), not on your machine. Then review `build/docs`, commit it and push.
+
+**The workflow** publishes from the branch `git init` created with the project. If you rename the branch, change `branches:` in the workflow to match. Its actions are pinned to commits, so a tag moved later can't change what runs with permission to publish. To update one, replace its commit and version comment with a newer release's; `git ls-remote https://github.com/actions/checkout refs/tags/v7.0.1`, for example, prints a release's commit.
+
+The pages are the build agent's code, and they run in the browser of everyone who visits the site, so review changes to `build/docs` before you push them, as you would anything you publish. On most GitHub plans, a Pages site is public even when its repository is private.
+
+<!-- /pages -->
 ## Cloning onto another machine
 
 Cloning this repository gives you the notes, the build code and these scripts. Nothing in the project depends on where it lives, so the clone can go in any folder, and it doesn't need the template. If you can, use a folder with the same name: the container and image names come from it.

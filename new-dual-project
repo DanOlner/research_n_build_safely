@@ -1,26 +1,31 @@
 #!/bin/bash
 # Create a new research + build project from the dual-project template.
-# Usage: new-dual-project [--with r,python,web] [--convos] <new-project-folder>
+# Usage: new-dual-project [--with r,python,web] [--convos] [--pages] <new-project-folder>
 #   --with    language stacks for the build container (default: r). Each stack installs its tools
 #             in the image and opens the firewall to its package hosts; nothing else is opened.
 #   --convos  also keep research's and the build agent's conversations as Markdown in llm_convos/,
 #             converted automatically by the export_all_convos scripts, and kept out of git until
 #             you allow each one.
+#   --pages   also publish build/docs/ as the repository's GitHub Pages site, with a workflow at
+#             the top of the repository that publishes it as committed whenever a push changes it.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 TEMPLATE="$HERE/project"
 CONVOS="$HERE/project-convos"   # added to the project by --convos
-usage() { echo "usage: new-dual-project [--with r,python,web] [--convos] <new-project-folder>" >&2; exit 1; }
+PAGES="$HERE/project-pages"     # added to the project by --pages
+usage() { echo "usage: new-dual-project [--with r,python,web] [--convos] [--pages] <new-project-folder>" >&2; exit 1; }
 
 stacks="r"
 convos=false
+pages=false
 target=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --with) [ $# -ge 2 ] || usage; stacks="$2"; shift 2 ;;
     --with=*) stacks="${1#--with=}"; shift ;;
     --convos) convos=true; shift ;;
+    --pages) pages=true; shift ;;
     -*) usage ;;
     *) [ -z "$target" ] || usage; target="$1"; shift ;;
   esac
@@ -48,9 +53,16 @@ for s in r python web; do
 done
 echo "stacks=${stacks// /}" >> "$target/VERSION"
 
+# The options' sections in the README and build/CLAUDE.md sit between <!-- name --> and
+# <!-- /name --> lines: kept, without those lines, when the option is chosen, else removed.
+section() {  # name, true or false, files
+  local name="$1" on="$2"; shift 2
+  if [ "$on" = true ]; then sed -i "\%^<!-- /\{0,1\}$name -->\$%d" "$@"
+  else sed -i "/^<!-- $name -->\$/,/^<!-- \/$name -->\$/d" "$@"; fi
+}
+
 # Conversation records: the convos script, the export_all_convos scripts and a folder for each
-# side, plus a hook that converts research's conversations when a research session ends. The
-# README's section about them sits between <!-- convos --> lines: kept with --convos, else removed.
+# side, plus a hook that converts research's conversations when a research session ends.
 if [ "$convos" = true ]; then
   cp -a "$CONVOS/." "$target/"
   chmod +x "$target/convos"
@@ -64,13 +76,18 @@ settings["hooks"]["SessionEnd"] = [{"hooks": [{
 with open(path, "w") as f:
     f.write(json.dumps(settings, indent=2) + "\n")
 EOF
-  sed -i '\%^<!-- /\{0,1\}convos -->$%d' "$target/README.md"
-else
-  sed -i '/^<!-- convos -->$/,/^<!-- \/convos -->$/d' "$target/README.md"
 fi
+section convos "$convos" "$target/README.md"
+
+# GitHub Pages: the workflow that publishes build/docs/, at the top of the repository.
+[ "$pages" = false ] || cp -a "$PAGES/." "$target/"
+section pages "$pages" "$target/README.md" "$target/build/CLAUDE.md"
 
 # The whole project folder is one git repository: research notes and build code together.
 git -C "$target" init -q
+# The Pages workflow publishes from the branch git init just created, whatever it's called.
+[ "$pages" = false ] || sed -i "s|\[DEFAULT_BRANCH\]|[$(git -C "$target" symbolic-ref --short HEAD)]|" \
+  "$target/.github/workflows/publish-docs.yml"
 # Refuses commits that add an Anthropic token or API key. A link rather than a copy, so it always
 # runs the project's own commit-check.
 ln -s ../../commit-check "$target/.git/hooks/pre-commit"
@@ -78,6 +95,7 @@ chmod +x "$target/container.sh" "$target/check.py" "$target/pdf-text" "$target/r
 
 echo "Created $target with stacks: $stacks"
 [ "$convos" = false ] || echo "Conversations from research and build will be kept in $target/llm_convos/"
+[ "$pages" = false ] || echo "build/docs/ will be published with GitHub Pages: see 'Publishing build/docs' in the README for the one-time setting"
 echo
 echo "Next steps (details in $target/README.md):"
 [ -f "$HOME/.config/claude-container/token.env" ] ||

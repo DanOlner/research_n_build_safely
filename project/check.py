@@ -295,6 +295,25 @@ def container_checks():
                                 capture_output=True, text=True).stdout.split(" ")[0]
         check_version("container", inside, "tested_container")
         found = {"tested_container": inside}
+
+        # A container started again outside container.sh has no firewall, since its rules don't
+        # survive a stop. container.sh must keep a container that has one and replace one that doesn't.
+        def container_id():
+            return subprocess.run(["docker", "inspect", "-f", "{{.Id}}", name],
+                                  capture_output=True, text=True).stdout.strip()
+        before = container_id()
+        p = subprocess.run([CONTAINER_SH, "start"], env=env, capture_output=True, text=True)
+        ok = p.returncode == 0 and container_id() == before
+        record("PASS" if ok else "FAIL", "container.sh keeps a container that has its firewall",
+               "" if ok else (p.stderr or p.stdout).strip()[-300:])
+        subprocess.run(["docker", "restart", "-t", "1", name], capture_output=True)
+        status = subprocess.run([CONTAINER_SH, "status"], env=env, capture_output=True, text=True).stdout.strip()
+        p = subprocess.run([CONTAINER_SH, "start"], env=env, capture_output=True, text=True)
+        blocked = subprocess.run(["docker", "exec", name, "curl", "-s", "--connect-timeout", "5",
+                                  "-o", "/dev/null", "https://example.com"], capture_output=True).returncode != 0
+        ok = "without its firewall" in status and p.returncode == 0 and container_id() != before and blocked
+        record("PASS" if ok else "FAIL", "container.sh replaces a container restarted without its firewall",
+               "" if ok else f"{status} {(p.stderr or p.stdout).strip()[-300:]}")
     finally:
         subprocess.run([CONTAINER_SH, "stop"], env=env, capture_output=True)
         subprocess.run(["docker", "volume", "rm", f"{name}-claude"], capture_output=True)

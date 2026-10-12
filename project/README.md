@@ -68,6 +68,26 @@ git restore --source=HEAD --staged --worktree -- build && git clean -ffdx -- bui
 
 Keep the `-- build` on both. `git reset --hard` would also throw away uncommitted research notes, and `git clean -ffdx` without `-- build` would delete your PDFs in `research/sources/`.
 
+**Closing the container.** Exiting Claude (`/exit`) leaves the container running, along with anything the agent started in it, such as a dev server. When you've finished, exit Claude, then run:
+
+```
+./container.sh stop
+```
+
+This removes the container. `build/` is on your machine, so its files stay, and so do the image and the Docker volume holding the build agent's conversations. Anything else the agent changed inside the container, such as tools it installed outside `build/`, goes with it. `./container.sh status` says whether the container is running.
+
+**Opening it again.** In this top folder, run:
+
+```
+./container.sh claude --continue
+```
+
+`--continue` carries on the last conversation, `--resume` lets you pick one, and with neither you start a new one. As the old container was removed, this makes a new one from the image and applies its firewall, after running the container checks if the image's Claude Code version hasn't passed them. Commit first, as before any build session.
+
+**Only start the container with `./container.sh`.** A container stopped some other way, by `docker stop` or by restarting your machine, is still there, stopped. Don't start it with `docker start`, `docker restart` or a Docker app's start button. Its firewall isn't kept when it stops, so it would come back able to reach any website. `./container.sh claude` replaces a stopped container with a new one, so use that. If one does get started some other way, `./container.sh status` says it's running without its firewall, and `start`, `claude`, `shell` and `firewall` replace it rather than use it. Anything run in it before then, such as through `docker exec`, had no firewall.
+
+**One folder, one container.** The container, its image and its conversation volume are named after this folder; `./container.sh name` prints the container's name. Stop the container before you rename or move the folder. A renamed folder gets a new image and container, and `--continue` won't find the old conversations, which stay in the old name's volume. Two projects in folders with the same name would share all three: `./container.sh claude` in one would open the other's running container, with the other project's `build/` in it. Give projects different folder names.
+
 **Tokens in commits.** A git hook, `commit-check`, refuses any commit that would add an Anthropic credential: the container's login token or an API key, which both start `sk-ant-`. It names the files and leaves fixing them to you. It only catches a credential written out in full, so an encoded copy gets past it, and it doesn't replace checking what changed. For a false alarm, `git commit --no-verify` skips it. Git doesn't copy hooks into clones, so a clone needs it linked again (see "Cloning onto another machine"). `./check.py` says if the hook is missing.
 
 Push from your machine as usual.

@@ -3,7 +3,8 @@
 #
 #   ./container.sh build      build the image (the first build takes several minutes), then run
 #                             the container checks if its Claude Code version hasn't passed them
-#   ./container.sh start      start the container and apply its firewall
+#   ./container.sh start      start the container and apply its firewall. This, claude, shell and
+#                             firewall replace a container that's running without its firewall
 #   ./container.sh claude     run Claude in the container, with permission checks skipped; first
 #                             runs the container checks if they haven't passed on this version,
 #                             and afterwards converts its conversations, if the project has ./convos
@@ -11,7 +12,7 @@
 #   ./container.sh firewall   re-apply the firewall, refreshing the allowed sites' addresses
 #   ./container.sh stop       stop and remove the container (the image and Claude's history are kept)
 #   ./container.sh rebuild    stop, rebuild the image and start again
-#   ./container.sh status     say whether the container is running
+#   ./container.sh status     say whether the container is running, and with its firewall
 #   ./container.sh name       print the container name
 #   ./container.sh sessions   write the build agent's saved conversations out as a tar stream, for ./convos
 #
@@ -41,6 +42,13 @@ SHM=1g
 PUBLISH_PORTS="${PUBLISH_PORTS-}"
 
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = "true" ]; }
+
+# The firewall's rules don't survive the container stopping, so a container started again outside
+# this script (docker start or restart, or a Docker app) runs without them, as does one whose
+# firewall setup was interrupted. This runs as root inside the container, so iptables is given by
+# its full path in a root-owned folder: found through PATH, the agent could put its own first.
+firewalled() { [ "$(docker exec -u root "$NAME" /usr/sbin/iptables -S OUTPUT 2>/dev/null | head -n1)" = "-P OUTPUT DROP" ]; }
+ready() { running && firewalled; }
 
 build() {
   # Install the same Claude Code version as on this machine. A new version also makes Docker redo
@@ -95,7 +103,12 @@ firewall() {
 }
 
 start() {
-  if running; then echo "$NAME is already running."; return; fi
+  if ready; then echo "$NAME is already running."; return; fi
+  # Replaced rather than given a firewall: connections it opened meanwhile would stay open.
+  if running; then
+    echo "$NAME is running without its firewall, so it's being replaced with a new container. Anything changed in it outside build/ is lost." >&2
+    docker rm -f "$NAME" >/dev/null
+  fi
   [ -f "$TOKEN_FILE" ] || { echo "Missing $TOKEN_FILE. See 'Container login' in README.md." >&2; exit 1; }
   for d in research/notes build/.devcontainer build/.vscode; do
     [ -d "$ROOT/$d" ] || { echo "Missing $ROOT/$d" >&2; exit 1; }
@@ -150,7 +163,7 @@ case "$cmd" in
   build) build ;;
   start) start ;;
   claude)
-    running || start
+    ready || start
     ensure_checked || exit 1
     note_old_image
     status=0
@@ -158,12 +171,17 @@ case "$cmd" in
     # With conversation records: turn the conversations into Markdown in llm_convos/build/.
     [ ! -x "$ROOT/convos" ] || "$ROOT/convos" build || true
     exit "$status" ;;
-  shell) running || start; docker exec -it -w /workspace "$NAME" zsh ;;
-  firewall) running || { echo "$NAME is not running." >&2; exit 1; }; firewall ;;
+  shell) ready || start; docker exec -it -w /workspace "$NAME" zsh ;;
+  firewall)
+    running || { echo "$NAME is not running." >&2; exit 1; }
+    if firewalled; then firewall; else start; fi ;;
   stop) stop ;;
   rebuild) stop; build; start ;;
-  status) if running; then echo "$NAME is running."; else echo "$NAME is not running."; fi ;;
+  status)
+    if ready; then echo "$NAME is running."
+    elif running; then echo "$NAME is running without its firewall. ./container.sh start, claude, shell or firewall will replace it."
+    else echo "$NAME is not running."; fi ;;
   name) echo "$NAME" ;;
   sessions) sessions ;;
-  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

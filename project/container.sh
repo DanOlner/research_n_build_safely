@@ -5,13 +5,15 @@
 #                             the container checks if its Claude Code version hasn't passed them
 #   ./container.sh start      start the container and apply its firewall
 #   ./container.sh claude     run Claude in the container, with permission checks skipped; first
-#                             runs the container checks if they haven't passed on this version
+#                             runs the container checks if they haven't passed on this version,
+#                             and afterwards converts its conversations, if the project has ./convos
 #   ./container.sh shell      open a shell in the container
 #   ./container.sh firewall   re-apply the firewall, refreshing the allowed sites' addresses
 #   ./container.sh stop       stop and remove the container (the image and Claude's history are kept)
 #   ./container.sh rebuild    stop, rebuild the image and start again
 #   ./container.sh status     say whether the container is running
 #   ./container.sh name       print the container name
+#   ./container.sh sessions   write the build agent's saved conversations out as a tar stream, for ./convos
 #
 # This script lives outside build/ on purpose: the agent can change anything in build/, so
 # nothing the host runs should live there.
@@ -131,6 +133,17 @@ stop() {
   if docker rm -f "$NAME" >/dev/null 2>&1; then echo "$NAME stopped."; else echo "$NAME was not running."; fi
 }
 
+# The .jsonl transcripts in Claude's volume, under 1 GB each, and nothing else from it, such as its
+# login. A throwaway container reads the volume read-only and with no network, so this works
+# whether or not the build container is running. Nothing is written if there's no volume yet.
+sessions() {
+  docker volume inspect "$NAME-claude" >/dev/null 2>&1 || return 0
+  docker run --rm --pull never --network none -u node \
+    --mount type=volume,source="$NAME-claude",target=/claude,readonly \
+    --entrypoint sh "$IMAGE" -c 'cd /claude/projects 2>/dev/null || exit 0
+      find . -mindepth 2 -maxdepth 2 -type f -name "*.jsonl" -size -1024M -print0 | tar --null -T - -cf -'
+}
+
 cmd="${1:-help}"
 [ $# -gt 0 ] && shift
 case "$cmd" in
@@ -140,12 +153,17 @@ case "$cmd" in
     running || start
     ensure_checked || exit 1
     note_old_image
-    docker exec -it -w /workspace "$NAME" claude --dangerously-skip-permissions "$@" ;;
+    status=0
+    docker exec -it -w /workspace "$NAME" claude --dangerously-skip-permissions "$@" || status=$?
+    # With conversation records: turn the conversations into Markdown in llm_convos/build/.
+    [ ! -x "$ROOT/convos" ] || "$ROOT/convos" build || true
+    exit "$status" ;;
   shell) running || start; docker exec -it -w /workspace "$NAME" zsh ;;
   firewall) running || { echo "$NAME is not running." >&2; exit 1; }; firewall ;;
   stop) stop ;;
   rebuild) stop; build; start ;;
   status) if running; then echo "$NAME is running."; else echo "$NAME is not running."; fi ;;
   name) echo "$NAME" ;;
-  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  sessions) sessions ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

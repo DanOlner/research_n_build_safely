@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Turn research's and the build agent's Claude Code conversations into Markdown in llm_convos/,
+with the export_all_convos scripts in scripts/ (github.com/DanOlner/export_all_convos).
+
+  ./convos              both sides
+  ./convos research     research's conversations, from ~/.claude/projects on this machine
+  ./convos build        the build agent's, from the container's Claude volume
+
+It also runs by itself: research's settings start it in the background when a research session
+ends (research --hook), and container.sh runs it for build when Claude in the container exits.
+
+Each run converts every conversation again, so ones that carried on are brought up to date, then
+prints a line for each side. The scripts' full output goes to .export.log in that side's folder.
+Each folder's .gitignore keeps its conversations out of git until you allow them there, and
+commit-check refuses a commit that adds one that isn't allowed.
+
+It lives in the project's top folder, outside research/ and build/, so neither agent can change it.
+"""
+import argparse
+import fcntl
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parent
+SCRIPTS = ROOT / "scripts"
+CONVOS = ROOT / "llm_convos"
+
+# True replaces your home folder with ~ in the Markdown (see scripts/README.md). Set it here rather
+# than redacting afterwards with scripts/redact_convos.py: the next run would undo that.
+REDACT = False
+
+# What the build agent's transcripts must look like to be copied out of its volume. Claude Code
+# keeps each session as <session id>.jsonl, in a folder named after where it ran: -workspace for
+# /workspace. container.sh only sends transcripts under 1 GB; this checks again.
+PROJECT = re.compile(r"-[A-Za-z0-9-]+")
+SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\.jsonl")
+LARGEST = 1 << 30
+
+sys.path.insert(0, str(SCRIPTS))
+from export_all_convos import find_convo_dir  # noqa: E402
+from publish_convos import git_tracked, read_entries  # noqa: E402
+
+
+def export(side, convo_dir, log, cwd=None):
+    """Convert one folder of transcripts into llm_convos/<side>/ and regenerate its list."""
+    log.flush()
+    cmd = [sys.executable, str(SCRIPTS / "export_all_convos.py"), f"--convo-dir={convo_dir}",
+           f"--output-dir={CONVOS / side}", *(["--redact"] if REDACT else [])]
+    return subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=log,
+                          stderr=subprocess.STDOUT).returncode
+
+
+def research(log):
+    folder = (ROOT / "research").resolve()
+    convo_dir, matched = find_convo_dir(folder)
+    # find_convo_dir also tries the folders above research/, whose conversations aren't research's.
+    if matched != folder:
+        print(f"No conversations for {folder} yet.", file=log)
+        return 0
+    return export("research", convo_dir, log)
+
+
+def build(log):
+    with tempfile.TemporaryDirectory() as tmp:
+        folders = copy_build_transcripts(Path(tmp), log)
+        if folders is None:
+            return 1
+        if not folders:
+            print("No conversations in the container's Claude volume yet.", file=log)
+            return 0
+        # Run from tmp, so each file's Source line reads -workspace/<session id>.jsonl rather than
+        # a temporary path that would change every run.
+        return max(export("build", f"./{f}", log, cwd=tmp) for f in sorted(folders))
+
+
+def copy_build_transcripts(dest, log):
+    """Copy the build agent's transcripts into dest/<folder>/, from the tar stream that
+    container.sh sends. The agent can change anything in that volume, so only regular files are
+    taken, from where Claude Code keeps transcripts, under names checked here: nothing it adds can
+    make this write outside dest. Returns the folders copied, or None if the volume can't be read."""
+    log.flush()
+    sender = subprocess.Popen([str(ROOT / "container.sh"), "sessions"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=log)
+    folders = set()
+    try:
+        with tarfile.open(fileobj=sender.stdout, mode="r|") as tar:
+            for member in tar:
+                parts = PurePosixPath(member.name).parts
+                if (len(parts) != 2 or not member.isreg() or member.size > LARGEST
+                        or not PROJECT.fullmatch(parts[0]) or not SESSION.fullmatch(parts[1])):
+                    continue
+                (dest / parts[0]).mkdir(exist_ok=True)
+                with tar.extractfile(member) as src, open(dest / parts[0] / parts[1], "wb") as out:
+                    shutil.copyfileobj(src, out)
+                folders.add(parts[0])
+    except tarfile.ReadError:
+        pass  # nothing sent: there's no volume yet, or nothing in it
+    finally:
+        sender.stdout.close()
+    if sender.wait() != 0:
+        print("Couldn't read the build agent's conversations from the container's Claude volume.", file=log)
+        return None
+    return folders
+
+
+def run(side):
+    """Convert one side's conversations, then print a line about them. Returns the exit status."""
+    folder = CONVOS / side
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / ".export.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # a second run for this side waits here, then runs
+        before = read_entries(folder / ".gitignore")
+        with open(folder / ".export.log", "w") as log:
+            try:
+                status = (research if side == "research" else build)(log)
+            except Exception as e:  # say why, rather than end in a traceback; it often runs unseen
+                print(f"Failed: {e!r}", file=log)
+                status = 1
+        after = read_entries(folder / ".gitignore")
+    name = side.capitalize()
+    if status:
+        tail = [l for l in (folder / ".export.log").read_text(errors="replace").splitlines() if l.strip()][-5:]
+        print(f"{name}: the conversion failed. The end of llm_convos/{side}/.export.log:")
+        print("\n".join("  " + line for line in tail))
+        return status
+    if not after:
+        print(f"{name}: no conversations yet.")
+        return 0
+    allowed = {n for n, (on, _) in after.items() if on}
+    new = len(after.keys() - before.keys())
+    print(f"{name}: {len(after)} conversation(s) in llm_convos/{side}/, {new} new, "
+          f"{len(allowed)} allowed into git.")
+    # scripts/publish_convos.py withdraws an allowed conversation whose scan result got worse.
+    withdrawn = sorted(n for n, (on, _) in before.items() if on and n not in allowed)
+    if withdrawn:
+        print("  Withdrawn, because the scan now finds more in them than when you allowed them. "
+              "Read them before allowing them again:")
+        print("\n".join(f"    {n}" for n in withdrawn))
+    tracked = sorted(git_tracked(folder) - allowed)
+    if tracked:
+        print("  In git but no longer allowed, so commit-check refuses commits that change them. "
+              f"Allow them again, or take them out of git with git rm --cached llm_convos/{side}/<name>:")
+        print("\n".join(f"    {n}" for n in tracked))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Convert research's and the build agent's conversations into Markdown in llm_convos/.")
+    ap.add_argument("side", nargs="?", choices=("research", "build"), help="only this side (default: both)")
+    ap.add_argument("--hook", action="store_true",
+                    help="run in the background and print nothing (research's settings use this)")
+    args = ap.parse_args()
+    if args.hook:
+        if os.environ.get("DUAL_PROJECT_CHECK"):
+            return 0  # a session check.py started: nothing worth keeping
+        # In the background, so the session doesn't wait for it, and so it isn't cut short when the
+        # session's end-of-session hooks run out of time, which could leave a half-written list.
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *([args.side] if args.side else [])],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return 0
+    statuses = [run(side) for side in ([args.side] if args.side else ["research", "build"])]
+    return 1 if any(statuses) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

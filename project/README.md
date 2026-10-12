@@ -8,6 +8,9 @@ A two-part Claude project, made from the dual-project template (version in `VERS
 This whole folder is one git repository, which you push: research notes, build code and these scripts, but not the documents in `research/sources/`. The build container never sees the repository. Once the container has run, empty `build/.git` and `build/.claude` folders owned by root appear. They're placeholders that stop the agent creating a repository or Claude Code settings there, and git ignores them.
 
 `container.sh`, `check.py`, `pdf-text`, `research-gate` and `commit-check` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
+<!-- convos -->
+So do `convos` and `scripts/`, which keep the conversation records (see "Conversation records").
+<!-- /convos -->
 
 The build container's language stacks are listed in `VERSION` (`stacks=`). See "Language stacks" below.
 
@@ -62,9 +65,34 @@ git restore --source=HEAD --staged --worktree -- build && git clean -ffdx -- bui
 
 Keep the `-- build` on both. `git reset --hard` would also throw away uncommitted research notes, and `git clean -ffdx` without `-- build` would delete your PDFs in `research/sources/`.
 
-**Tokens in commits.** A git hook, `commit-check`, refuses any commit that would add an Anthropic credential: the container's login token or an API key, which both start `sk-ant-`. It names the files and leaves fixing them to you. It only catches a credential written out in full, so an encoded copy gets past it, and it doesn't replace checking what changed. For a false alarm, `git commit --no-verify` skips it. Git doesn't copy hooks into clones, so in a new clone of this project, run `ln -s ../../commit-check .git/hooks/pre-commit` in its top folder. `./check.py` says if the hook is missing.
+**Tokens in commits.** A git hook, `commit-check`, refuses any commit that would add an Anthropic credential: the container's login token or an API key, which both start `sk-ant-`. It names the files and leaves fixing them to you. It only catches a credential written out in full, so an encoded copy gets past it, and it doesn't replace checking what changed. For a false alarm, `git commit --no-verify` skips it. Git doesn't copy hooks into clones, so a clone needs it linked again (see "Cloning onto another machine"). `./check.py` says if the hook is missing.
 
 Push from your machine as usual.
+
+## Cloning onto another machine
+
+Cloning this repository gives you the notes, the build code and these scripts. Nothing in the project depends on where it lives, so the clone can go in any folder, and it doesn't need the template. If you can, use a folder with the same name: the container and image names come from it.
+
+**Once per machine:**
+
+- Install Claude Code, and poppler-utils for PDFs (`sudo apt install poppler-utils`).
+- Make Docker usable without `sudo`: `sudo usermod -aG docker $USER`, then log out of your desktop session and back in.
+- Save a container login token, as in step 2 of "First-time setup". Make a new one on each machine rather than copying one across, and never put it in the repository.
+
+**Then, in the clone's top folder:**
+
+1. **Link the commit hook:** `ln -s ../../commit-check .git/hooks/pre-commit`. Git doesn't copy hooks into clones.
+2. **Trust the project:** `cd research && claude`, accept the trust dialog, then type `/exit`. Each machine keeps its own list of trusted folders.
+3. **Build the container image:** `./container.sh build`. Images aren't in the repository.
+4. **Run `./check.py` yourself.** Every line should say PASS. Don't leave this to the automatic checks: they only run when Claude Code's version differs from the one in `VERSION`, and `VERSION` comes with the clone. On a machine with the same version, they would count the other machine's pass and not run, and miss anything particular to this machine, such as its own Claude Code settings.
+
+**What the clone doesn't have:**
+
+- **The documents in `research/sources/`.** Git ignores them. Copy them across yourself, then run `./pdf-text`.
+- **Conversation history.** Research sessions are kept in `~/.claude/projects/` and the build agent's in a Docker volume, both on the machine where they happened. `claude --continue` and `./container.sh claude --continue` start fresh on a new machine. The notes and the two `CLAUDE.md` files are what carry across.
+- **What `build/.gitignore` leaves out**, such as `.venv/` and `node_modules/`, plus anything the build agent has added there, like generated results. Reinstall or regenerate it inside the container. Read `build/.gitignore` before you push, so you know what won't come across.
+
+**Working from two machines:** `./check.py --accept` and the automatic checks write to `VERSION`, so pulling can bring a conflict there. Keep the lines from the machine with the newer Claude Code version.
 
 ## Working with PDFs
 
@@ -86,6 +114,37 @@ It writes `report.txt` next to each new or changed `report.pdf`, starting each p
 cd research && claude --disallowedTools WebFetch WebSearch
 ```
 
+<!-- convos -->
+## Conversation records
+
+Research's and the build agent's conversations are kept as readable Markdown, by the [export_all_convos](https://github.com/DanOlner/export_all_convos) scripts in `scripts/`, in a folder for each:
+
+- **`llm_convos/research/`**: converted in the background each time a research session ends.
+- **`llm_convos/build/`**: converted each time `./container.sh claude` exits. The build agent can change anything in its Claude volume, so only its transcripts are copied out, under names `convos` checks first.
+
+To convert them yourself, run `./convos`, or `./convos research` or `./convos build` for one side. Each run converts every conversation again, so ones that carried on are brought up to date, and prints a line for each side. The full output of the last run is in each folder's `.export.log`.
+
+**Nothing is committed until you allow it.** Each folder's `.gitignore` ignores everything in it, and lists every conversation, commented out, with what a scan for credentials and personal information found:
+
+```
+# --- [clean] 2026-10-12_1105_Find_the_latest_ONS_business_survey.md
+# !2026-10-12_1105_Find_the_latest_ONS_business_survey.md
+```
+
+To publish one, read it, then delete the `# ` in front of its `!` line. Put the `# ` back to withdraw it. Your choices are kept each time the list is regenerated, except that a conversation whose scan result gets worse is withdrawn, so you decide again. `scripts/README.md` has the details, including `publish_convos.py` for doing this from the command line (give it `--dir llm_convos/research` or `--dir llm_convos/build`).
+
+`commit-check` refuses a commit that adds a conversation the staged `.gitignore` doesn't allow, or an allowed one the scan finds a credential in. Git keeps tracking a conversation once it's committed, whatever `.gitignore` says, so this is what keeps a withdrawn conversation's new content out: allow it again, or take it out of git with `git rm --cached`.
+
+Before you allow a conversation:
+
+- **Read it.** Research's conversations quote the documents in `research/sources/`, which git otherwise keeps out. The build agent's are its own words, so weigh them as you would its code.
+- **The list itself is committed**, so the names of all the conversations, made from the first words of each, are in the repository even when the conversations aren't.
+- **Don't edit an exported file**: the next run overwrites it. To publish a shortened version, copy it to a new name in the same folder, edit the copy and allow that.
+- **Your home folder is in every path** in research's conversations. To have it replaced with `~`, set `REDACT = True` near the top of `convos`. Running `scripts/redact_convos.py` afterwards doesn't last, because the next run converts everything again.
+
+Only research and build conversations are kept, not sessions you start elsewhere, such as in this top folder. Ones you start from `./container.sh shell` are converted the next time `./container.sh claude` exits or you run `./convos`. A clone has the conversations you allowed; the rest stay on the machine they were made on. Use `./convos` rather than `scripts/export_all_convos.py`, which, run from here, would look for this top folder's conversations instead. Its `--install-hook` isn't needed either: `commit-check` does that job.
+
+<!-- /convos -->
 ## Changing what the container can reach
 
 Edit `build/.devcontainer/allowed-domains.txt` (one domain per line), then run `./container.sh rebuild`. Each domain you add is somewhere the container can reach, along with its login token, so add only what the build needs.
@@ -130,3 +189,4 @@ The safety checks run by themselves when Claude Code's version changes, and each
 - The container's login token is visible to the agent. It can only reach the Anthropic API and the allowed domains, and it can only make model requests. `commit-check` stops it being committed as plain text, but not encoded.
 - Research fetches can reach any website.
 - Opening `build/` with VS Code's Dev Containers extension uses `build/.devcontainer/devcontainer.json`. It mirrors `container.sh` but hasn't been tested, and may need the VS Code hosts uncommented in `allowed-domains.txt`.
+- Machines other than Linux. The scripts and the container's firewall have only been tested on Linux.

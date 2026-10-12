@@ -5,7 +5,15 @@
 #   ln -s ../../commit-check .git/hooks/pre-commit
 # It reads each staged file as git will store it, so .gitattributes can't hide a file from it.
 # It only catches a credential written out in full: an encoded copy, such as base64, gets past it.
+#
+# With conversation records (new-dual-project --convos), it also refuses a conversation in
+# llm_convos/research/ or llm_convos/build/ that the staged copy of its folder's .gitignore doesn't
+# allow, or that the scan in scripts/ finds a credential in: other services' keys too, not only
+# Anthropic's. A conversation that's already in git stays in it whatever .gitignore says, so this
+# is what keeps a withdrawn one's new content out.
 set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 # Anthropic credentials start sk-ant-, then a type such as oat01- and the secret. The [-] stops
 # this file matching itself, and the length lets notes that only mention the prefix through.
@@ -13,23 +21,52 @@ pattern='sk-ant[-][A-Za-z0-9_-]{20,}'
 
 # Compare with the last commit, or with an empty tree before the first one.
 against=$(git rev-parse --verify -q HEAD || git hash-object -t tree /dev/null)
-staged=$(mktemp)
-trap 'rm -f "$staged" "$staged.blob"' EXIT
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 # One record per added or changed file: ":oldmode newmode oldsha newsha status", then its path.
-git diff-index --cached -z --no-renames --diff-filter=d "$against" > "$staged"
+git diff-index --cached -z --no-renames --diff-filter=d "$against" > "$tmp/staged"
 
-found=()
+found=()      # files with an Anthropic credential in them
+unlisted=()   # conversations their folder's .gitignore doesn't allow
+flagged=()    # allowed conversations the scan finds a credential in
 while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
   read -r _ mode _ sha _ <<< "$meta"
   [ "$mode" = 160000 ] && continue   # a repository inside this one: git stores only its commit id
   # The whole blob goes into a file first, so grep stopping early can't fail the read.
-  git cat-file blob "$sha" > "$staged.blob"
-  if LC_ALL=C grep -aqE "$pattern" "$staged.blob"; then found+=("$path"); fi
-done < "$staged"
+  git cat-file blob "$sha" > "$tmp/blob"
+  if LC_ALL=C grep -aqE "$pattern" "$tmp/blob"; then found+=("$path"); fi
+  case "$path" in
+    llm_convos/research/.gitignore | llm_convos/build/.gitignore) ;;
+    llm_convos/research/* | llm_convos/build/*)
+      side="${path#llm_convos/}"; side="${side%%/*}"; name="${path#llm_convos/$side/}"
+      # Allowed means a "!<name>" line in the .gitignore this commit records; none if there isn't one.
+      [ -f "$tmp/allow-$side" ] ||
+        git show ":llm_convos/$side/.gitignore" > "$tmp/allow-$side" 2>/dev/null || true
+      if grep -qxF -- "!$name" "$tmp/allow-$side"; then
+        # Exit code 1 when it finds a credential; anything else but 0 means it couldn't run.
+        python3 "$ROOT/scripts/scan_convos.py" --severity BLOCK --quiet "$tmp/blob" >/dev/null 2>&1 ||
+          flagged+=("$path")
+      else
+        unlisted+=("$path")
+      fi ;;
+  esac
+done < "$tmp/staged"
 
-[ ${#found[@]} -eq 0 ] && exit 0
+[ ${#found[@]} -eq 0 ] && [ ${#unlisted[@]} -eq 0 ] && [ ${#flagged[@]} -eq 0 ] && exit 0
 # File names only: printing the matching lines would put the credential on screen.
-echo "Commit refused: these staged files contain what looks like an Anthropic token or API key:" >&2
-printf '  %s\n' "${found[@]}" >&2
-echo "Remove it from each file, stage them again, then commit." >&2
+if [ ${#found[@]} -gt 0 ]; then
+  echo "Commit refused: these staged files contain what looks like an Anthropic token or API key:" >&2
+  printf '  %s\n' "${found[@]}" >&2
+  echo "Remove it from each file, stage them again, then commit." >&2
+fi
+if [ ${#unlisted[@]} -gt 0 ]; then
+  echo "Commit refused: these staged conversations aren't allowed by their folder's .gitignore:" >&2
+  printf '  %s\n' "${unlisted[@]}" >&2
+  echo "To publish one, read it, delete the \"# \" in front of its \"!\" line in that .gitignore, and stage the .gitignore too. To keep one out of git, run: git rm --cached <file>" >&2
+fi
+if [ ${#flagged[@]} -gt 0 ]; then
+  echo "Commit refused: the conversation scan finds what looks like a credential in these staged conversations, or couldn't run:" >&2
+  printf '  %s\n' "${flagged[@]}" >&2
+  echo "See its findings with: python3 scripts/scan_convos.py --severity BLOCK <file>. Unstage each one with: git restore --staged <file>. Treat a credential in a conversation as leaked, and replace it." >&2
+fi
 exit 1

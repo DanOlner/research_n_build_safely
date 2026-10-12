@@ -1,0 +1,8 @@
+# Conversation exports — DEFAULT DENY.
+#
+# Nothing in this folder reaches the repo until it is explicitly allowed.
+# Run scripts/publish_convos.py to list the conversations, see what each one
+# contains, and choose which to publish.
+
+*
+!.gitignore

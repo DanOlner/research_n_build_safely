@@ -1,19 +1,26 @@
 #!/bin/bash
 # Create a new research + build project from the dual-project template.
-# Usage: new-dual-project [--with r,python,web] <new-project-folder>
-#   --with  language stacks for the build container (default: r). Each stack installs its tools
-#           in the image and opens the firewall to its package hosts; nothing else is opened.
+# Usage: new-dual-project [--with r,python,web] [--convos] <new-project-folder>
+#   --with    language stacks for the build container (default: r). Each stack installs its tools
+#             in the image and opens the firewall to its package hosts; nothing else is opened.
+#   --convos  also keep research's and the build agent's conversations as Markdown in llm_convos/,
+#             converted automatically by the export_all_convos scripts, and kept out of git until
+#             you allow each one.
 set -euo pipefail
 
-TEMPLATE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/project"
-usage() { echo "usage: new-dual-project [--with r,python,web] <new-project-folder>" >&2; exit 1; }
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+TEMPLATE="$HERE/project"
+CONVOS="$HERE/project-convos"   # added to the project by --convos
+usage() { echo "usage: new-dual-project [--with r,python,web] [--convos] <new-project-folder>" >&2; exit 1; }
 
 stacks="r"
+convos=false
 target=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --with) [ $# -ge 2 ] || usage; stacks="$2"; shift 2 ;;
     --with=*) stacks="${1#--with=}"; shift ;;
+    --convos) convos=true; shift ;;
     -*) usage ;;
     *) [ -z "$target" ] || usage; target="$1"; shift ;;
   esac
@@ -41,6 +48,27 @@ for s in r python web; do
 done
 echo "stacks=${stacks// /}" >> "$target/VERSION"
 
+# Conversation records: the convos script, the export_all_convos scripts and a folder for each
+# side, plus a hook that converts research's conversations when a research session ends. The
+# README's section about them sits between <!-- convos --> lines: kept with --convos, else removed.
+if [ "$convos" = true ]; then
+  cp -a "$CONVOS/." "$target/"
+  chmod +x "$target/convos"
+  python3 - "$target/research/.claude/settings.json" <<'EOF'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    settings = json.load(f)
+settings["hooks"]["SessionEnd"] = [{"hooks": [{
+    "type": "command", "command": '"$CLAUDE_PROJECT_DIR"/../convos research --hook', "timeout": 10}]}]
+with open(path, "w") as f:
+    f.write(json.dumps(settings, indent=2) + "\n")
+EOF
+  sed -i '\%^<!-- /\{0,1\}convos -->$%d' "$target/README.md"
+else
+  sed -i '/^<!-- convos -->$/,/^<!-- \/convos -->$/d' "$target/README.md"
+fi
+
 # The whole project folder is one git repository: research notes and build code together.
 git -C "$target" init -q
 # Refuses commits that add an Anthropic token or API key. A link rather than a copy, so it always
@@ -49,6 +77,7 @@ ln -s ../../commit-check "$target/.git/hooks/pre-commit"
 chmod +x "$target/container.sh" "$target/check.py" "$target/pdf-text" "$target/research-gate" "$target/commit-check"
 
 echo "Created $target with stacks: $stacks"
+[ "$convos" = false ] || echo "Conversations from research and build will be kept in $target/llm_convos/"
 echo
 echo "Next steps (details in $target/README.md):"
 [ -f "$HOME/.config/claude-container/token.env" ] ||

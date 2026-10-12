@@ -3,7 +3,7 @@
 tested to enforce. It also runs by itself after Claude Code updates: research-gate runs the
 research half when a research session starts on a new version, and container.sh runs the
 container half when the image has a new version. A full run also checks the git hook that keeps
-Anthropic tokens out of commits.
+Anthropic tokens out of commits and, with conversation records, conversations that aren't allowed.
 
 Usage: ./check.py [--research-only | --container-only] [--accept | --auto]
 
@@ -302,7 +302,8 @@ def container_checks():
 
 
 def git_checks():
-    """The pre-commit hook that refuses commits adding an Anthropic token: linked in, and working."""
+    """The pre-commit hook that refuses commits adding an Anthropic token: linked in, and working.
+    With conversation records, also what keeps conversations out of git until they're allowed."""
     print("Git hook")
     git = lambda *a, **kw: subprocess.run(["git", "-C", str(ROOT), *a], capture_output=True, text=True, **kw)
     hook = git("rev-parse", "--git-path", "hooks/pre-commit").stdout.strip()
@@ -315,20 +316,47 @@ def git_checks():
            "" if linked else "in this folder, run: ln -s ../../commit-check .git/hooks/pre-commit")
     if not linked:
         return
-    # Stage a made-up token in a temporary index and object store, so the repository is untouched.
     objects = ROOT / git("rev-parse", "--git-path", "objects").stdout.strip()
-    name = f"check-token-{secrets.token_hex(4)}.txt"
-    with tempfile.TemporaryDirectory() as tmp:
-        env = dict(os.environ, GIT_INDEX_FILE=f"{tmp}/index", GIT_OBJECT_DIRECTORY=f"{tmp}/objects",
-                   GIT_ALTERNATE_OBJECT_DIRECTORIES=str(objects))
-        os.mkdir(f"{tmp}/objects")
-        fake = "sk-ant-check01-" + secrets.token_urlsafe(30)
-        blob = git("hash-object", "-w", "--stdin", input=fake + "\n", env=env).stdout.strip()
-        git("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=env)
-        p = subprocess.run([str(hook)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
-    ok = p.returncode == 1 and name in p.stderr
-    record("PASS" if ok else "FAIL", "pre-commit hook refuses a staged Anthropic token",
-           "" if ok else p.stderr.strip()[:200] or f"exit code {p.returncode}")
+
+    def commit(files):
+        """Run the hook on files ({path: content}) staged in a temporary index and object store,
+        so the repository is untouched."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, GIT_INDEX_FILE=f"{tmp}/index", GIT_OBJECT_DIRECTORY=f"{tmp}/objects",
+                       GIT_ALTERNATE_OBJECT_DIRECTORIES=str(objects))
+            os.mkdir(f"{tmp}/objects")
+            for path, content in files.items():
+                blob = git("hash-object", "-w", "--stdin", input=content, env=env).stdout.strip()
+                git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=env)
+            return subprocess.run([str(hook)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+
+    def hook_check(check, p, path, refuses=True):
+        """PASS when the hook refused the commit and named path, or, if not refuses, let it through."""
+        ok = (p.returncode == 1 and path in p.stderr) if refuses else p.returncode == 0
+        record("PASS" if ok else "FAIL", check, "" if ok else p.stderr.strip()[:200] or f"exit code {p.returncode}")
+
+    tag = secrets.token_hex(4)
+    name = f"check-token-{tag}.txt"
+    p = commit({name: "sk-ant-check01-" + secrets.token_urlsafe(30) + "\n"})
+    hook_check("pre-commit hook refuses a staged Anthropic token", p, name)
+    if not (ROOT / "llm_convos").is_dir():
+        return
+    # Conversation records: each side's .gitignore ignores a new conversation, and the hook
+    # refuses one that the staged .gitignore doesn't allow, or that the scan finds a credential in.
+    new = [f"llm_convos/{side}/check-{tag}.md" for side in ("research", "build")]
+    shown = [n for n in new if git("check-ignore", "-q", "--no-index", n).returncode != 0]
+    record("FAIL" if shown else "PASS", "git ignores new conversations until they're allowed",
+           ", ".join(f"{n.rsplit('/', 1)[0]}/.gitignore doesn't ignore it" for n in shown))
+    deny = "*\n!.gitignore\n"
+    research_convo, build_convo = new
+    p = commit({"llm_convos/research/.gitignore": f"{deny}# !check-{tag}.md\n", research_convo: "A conversation\n"})
+    hook_check("pre-commit hook refuses a conversation that isn't allowed", p, research_convo)
+    p = commit({"llm_convos/build/.gitignore": f"{deny}!check-{tag}.md\n", build_convo: "A conversation\n"})
+    hook_check("pre-commit hook lets an allowed conversation through", p, build_convo, refuses=False)
+    # A made-up GitHub token: the scan knows it, and commit-check's own Anthropic pattern doesn't.
+    p = commit({"llm_convos/build/.gitignore": f"{deny}!check-{tag}.md\n",
+                build_convo: f"A conversation with ghp_{secrets.token_hex(20)} in it\n"})
+    hook_check("pre-commit hook refuses an allowed conversation with a credential in it", p, build_convo)
 
 
 def check_version(where, version, key):

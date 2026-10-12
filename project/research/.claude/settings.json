@@ -9,7 +9,8 @@
     "allow": [
       "WebSearch",
       "WebFetch",
-      "Edit(/notes/**)"
+      "Edit(/notes/**)",
+      "Edit(/CLAUDE.md)"
     ],
     "deny": [
       "Bash",
@@ -23,6 +24,10 @@
       "CronCreate",
       "mcp__*",
       "Edit(/.claude/**)",
+      "Edit(/notes/**/CLAUDE.md)",
+      "Edit(/notes/**/CLAUDE.local.md)",
+      "Edit(/notes/**/AGENTS.md)",
+      "Edit(/notes/**/.claude/**)",
       "Read(./.env*)",
       "Read(~/.ssh/**)",
       "Read(~/.aws/**)",
@@ -38,6 +43,12 @@
             "command": "\"$CLAUDE_PROJECT_DIR\"/../research-gate start",
             "timeout": 300,
             "statusMessage": "Checking that this Claude Code version keeps research's restrictions in place (after an update this runs once and takes about 10 seconds)"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/../convert-docs --hook",
+            "timeout": 300,
+            "statusMessage": "Making text copies of new documents in sources/"
           }
         ]
       }
@@ -48,6 +59,18 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/../research-gate prompt",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/../research-gate edit",
             "timeout": 20
           }
         ]

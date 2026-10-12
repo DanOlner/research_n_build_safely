@@ -2,12 +2,12 @@
 
 A two-part Claude project, made from the dual-project template (version in `VERSION`).
 
-- **`research/`**: on your machine, Claude searches and reads the web and any documents you put in `research/sources/`, and writes notes into `research/notes/`. It can't run commands, read outside its folder, or write outside `notes/`.
+- **`research/`**: on your machine, Claude searches and reads the web and any documents you put in `research/sources/`, and writes notes into `research/notes/`. It can also edit `research/CLAUDE.md`, so you can build up the project spec there together. It can't run commands, read outside its folder, or write anywhere else.
 - **`build/`**: Claude works on the project inside a Docker container with permission checks skipped. It reads the notes at `/notes`, read-only.
 
 This whole folder is one git repository, which you push: research notes, build code and these scripts, but not the documents in `research/sources/`. The build container never sees the repository. Once the container has run, empty `build/.git` and `build/.claude` folders owned by root appear. They're placeholders that stop the agent creating a repository or Claude Code settings there, and git ignores them.
 
-`container.sh`, `check.py`, `pdf-text`, `research-gate` and `commit-check` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
+`container.sh`, `check.py`, `convert-docs`, `research-gate` and `commit-check` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
 <!-- convos -->
 So do `convos` and `scripts/`, which keep the conversation records (see "Conversation records").
 <!-- /convos -->
@@ -25,9 +25,10 @@ The build container's language stacks are listed in `VERSION` (`stacks=`). See "
    mkdir -p -m 700 ~/.config/claude-container
    (umask 077; read -rsp 'Paste token: ' t; echo; printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$t" > ~/.config/claude-container/token.env)
    ```
-3. **Build the container image**: `./container.sh build`. The first build takes several minutes.
-4. **Check everything**: `./check.py`. Every line should say PASS.
-5. **Make the first commit**: `git add -A && git commit -m "New project"`. It's your restore point before the build agent runs.
+3. **Install the document tools** (once per machine): `sudo apt install bubblewrap poppler-utils pandoc libreoffice`, and `ocrmypdf` if you'll have scanned PDFs. "Working with documents" says what each is for.
+4. **Build the container image**: `./container.sh build`. The first build takes several minutes.
+5. **Check everything**: `./check.py`. Every line should say PASS.
+6. **Make the first commit**: `git add -A && git commit -m "New project"`. It's your restore point before the build agent runs.
 
 ## Everyday use
 
@@ -50,7 +51,7 @@ git status --ignored
 git diff
 ```
 
-The first lists every file and folder that was added, changed or deleted: by the build agent in `build/`, and by research in `research/notes/`. It also lists what the `.gitignore` files hide from a plain `git status`, such as `.venv/`, `node_modules/` and the documents in `research/sources/`, though not what changed inside them. The second shows the changes inside files you'd already committed. It doesn't show new files, so open those yourself. Pay most attention to:
+The first lists every file and folder that was added, changed or deleted: by the build agent in `build/`, and by research in `research/notes/` and `research/CLAUDE.md`. It also lists what the `.gitignore` files hide from a plain `git status`, such as `.venv/`, `node_modules/` and the documents in `research/sources/`, though not what changed inside them. The second shows the changes inside files you'd already committed. It doesn't show new files, so open those yourself. Pay most attention to:
 
 - R scripts, `.Rprofile`, `.Renviron` and `.RData`
 - Python scripts, `setup.py` and `pyproject.toml`
@@ -66,7 +67,7 @@ To throw away everything the build agent did since your last commit, including i
 git restore --source=HEAD --staged --worktree -- build && git clean -ffdx -- build
 ```
 
-Keep the `-- build` on both. `git reset --hard` would also throw away uncommitted research notes, and `git clean -ffdx` without `-- build` would delete your PDFs in `research/sources/`.
+Keep the `-- build` on both. `git reset --hard` would also throw away uncommitted research notes, and `git clean -ffdx` without `-- build` would delete your documents in `research/sources/`.
 
 **Closing the container.** Exiting Claude (`/exit`) leaves the container running, along with anything the agent started in it, such as a dev server. When you've finished, exit Claude, then run:
 
@@ -114,7 +115,7 @@ Cloning this repository gives you the notes, the build code and these scripts. N
 
 **Once per machine:**
 
-- Install Claude Code, and poppler-utils for PDFs (`sudo apt install poppler-utils`).
+- Install Claude Code, and the document tools, as in step 3 of "First-time setup".
 - Make Docker usable without `sudo`: `sudo usermod -aG docker $USER`, then log out of your desktop session and back in.
 - Save a container login token, as in step 2 of "First-time setup". Make a new one on each machine rather than copying one across, and never put it in the repository.
 
@@ -127,27 +128,67 @@ Cloning this repository gives you the notes, the build code and these scripts. N
 
 **What the clone doesn't have:**
 
-- **The documents in `research/sources/`.** Git ignores them. Copy them across yourself, then run `./pdf-text`.
+- **The documents in `research/sources/`**, and their copies. Git ignores them. Copy the documents across yourself. Their copies are made when research next starts, or run `./convert-docs`.
+- **`exports/`**, which git ignores too.
 - **Conversation history.** Research sessions are kept in `~/.claude/projects/` and the build agent's in a Docker volume, both on the machine where they happened. `claude --continue` and `./container.sh claude --continue` start fresh on a new machine. The notes and the two `CLAUDE.md` files are what carry across.
 - **What `build/.gitignore` leaves out**, such as `.venv/` and `node_modules/`, plus anything the build agent has added there, like generated results. Reinstall or regenerate it inside the container. Read `build/.gitignore` before you push, so you know what won't come across.
 
 **Working from two machines:** `./check.py --accept` and the automatic checks write to `VERSION`, so pulling can bring a conflict there. Keep the lines from the machine with the newer Claude Code version.
 
-## Working with PDFs
+## Working with documents
 
-Copy PDFs into `research/sources/` (subfolders are fine), then make text copies of the new ones:
+Copy documents into `research/sources/` (subfolders are fine). When a research session starts, `convert-docs` makes a text copy of each new or changed one, beside it, and a short message lists what it did. A session start spends at most about two and a half minutes on this; anything left is done next time, or when you run `./convert-docs`. Research searches and reads the copies, which is exact and cheap, and opens the originals for charts, garbled tables and scanned pages.
 
-```
-./pdf-text
-```
+| You add | Its copy |
+|---|---|
+| A PDF, `report.pdf` | `report.pdf.txt`. Each page starts with a `--- PDF page N ---` line, so Claude can cite pages, and the PDF's title, author and dates, when it has them, are at the top. |
+| A Word, OpenDocument, RTF, EPUB or HTML file (`.docx`, `.doc`, `.odt`, `.rtf`, `.epub`, `.html`) | `report.docx.md`, in Markdown. |
+| Slides (`.pptx`, `.ppt`, `.ppsx`, `.pps`, `.odp`) | `talk.pptx.txt`. Each slide starts with a `--- slide N ---` line. Speaker notes aren't included. |
+| A spreadsheet (`.xlsx`, `.xlsm`, `.xls`, `.ods`) | A folder, `data.xlsx.sheets/`, with a CSV of each sheet's values as displayed. |
+| An archive (`.zip`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`) | A folder, `data.zip.files/`, with the archive unpacked and its documents copied in the same way. |
 
-It writes `report.txt` next to each new or changed `report.pdf`, starting each page with a `--- PDF page N ---` line so Claude can cite pages. Research sessions search and read the text copies, which is exact and cheap. They open a PDF itself for charts, tables the copy garbles, and scanned pages, which have no text to copy. `./pdf-text` says how many pages in each document have little or no text. To redo a copy, delete the `.txt` and run it again.
+A copy is remade when its document changes. To redo one, delete it and run `./convert-docs`. Deleting a document leaves its copy, so delete both.
 
-`./pdf-text` and Claude's own PDF reading both need poppler-utils, once per machine: `sudo apt install poppler-utils`.
+**Running it yourself.** In this top folder:
+
+| Command | What it does |
+|---|---|
+| `./convert-docs` | Copies every new or changed document, as a research session does when it starts. Use it for documents you add during a session. |
+| `./convert-docs report.pdf` | Copies only that document, or that folder. |
+| `./convert-docs ocr report.pdf` | Redoes a PDF's copy, reading its scanned pages with OCR. Pages that have text keep it. OCR is slow, so it only runs when you ask. When `convert-docs` finds pages with little or no text, it prints this command for those PDFs. |
+| `./convert-docs pages report.pdf 12-14` | Images of PDF pages 12 to 14, for print too small to read in the PDF. Each page is split into two overlapping halves at 200 dpi: top and bottom (`report.pdf.page-12-top.png`), or left and right for a landscape page. Claude sees each half in more detail than it sees a whole page. Give pages as `12`, `12-14` or `3,7,12-14`. |
+| `./convert-docs images report.pdf` | Saves the pictures embedded in a PDF to `report.pdf.images/`. `page-012-003.png` is on page 12. Charts drawn as vector graphics aren't pictures, so use `pages` for those. |
+| `./convert-docs compare old.pdf new.pdf` | Writes the wording that changed between two documents to `old.pdf.vs.new.pdf.diff`, word by word, with the page each change is on. It compares their copies, so it works for any document with a copy, and for text files. |
+| `./convert-docs export topic.md` | Turns a note in `research/notes/` into a Word document, `exports/topic.docx`. Add `--to odt`, `--to pdf` or `--to html` for other formats. You can give several notes at once. |
+
+Name documents from this folder (`research/sources/report.pdf`) or from inside `research/sources/` (`report.pdf`), and notes from inside `research/notes/` (`topic.md`). Research can't run these, but it may ask you to, giving the command.
+
+**Packages**, once per machine. A document whose converter isn't installed is skipped, with a message naming the package.
+
+| Package | Needed for |
+|---|---|
+| `bubblewrap` | Everything: each converter runs inside it (see below) |
+| `poppler-utils` | PDFs, slides, `pages` and `images`, and Claude's own PDF reading |
+| `pandoc` | Word, OpenDocument, RTF, EPUB and HTML files, and `export` |
+| `libreoffice` | `.doc` files, slides and spreadsheets, and `export` to Word or PDF |
+| `ocrmypdf` | `ocr` |
+
+`sudo apt install bubblewrap poppler-utils pandoc libreoffice ocrmypdf` installs them all.
+
+**The converters are sandboxed.** A document can be made to exploit a bug in its converter, or to pull other files from your machine into its copy, where research would read them. So `convert-docs` runs each converter inside bubblewrap:
+
+- It can read only the document it's converting, and write only to an empty folder of its own.
+- It has no network.
+- It sees system folders such as `/usr` and `/etc`, but not your home folder, this project or Docker.
+- pandoc also runs with its own `--sandbox` option.
+
+Archives are unpacked with nothing outside their folder and no links leading out of it, and without `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/` or `.git/`. Claude Code loads the first four as instructions when research reads files near them. `convert-docs` warns about any such files you put in `research/sources/` yourself. `./check.py` checks the sandbox and the archive rules.
+
+**Exports** go in `exports/`, which neither agent can see and git ignores. Notes are written by research, which reads the web. So raw HTML and LaTeX in a note come out as plain text, and pictures as their descriptions. Read an export before you send it on, as you would the note.
 
 `sources/` stays on the research side: the build container sees only `notes/`. Git ignores it too, since journal articles are usually copyrighted and PDFs soon get too big for a repository. Claude can't write in `sources/`, so what it learns from the documents goes into `notes/`, which is committed.
 
-**Confidential documents.** A PDF can hide instructions, as a web page can, and research sessions can fetch any website. For confidential documents, start research without web tools, so a session has no tool for sending their contents to a website:
+**Confidential documents.** A document can hide instructions, as a web page can, and research sessions can fetch any website. For confidential documents, start research without web tools, so a session has no tool for sending their contents to a website:
 
 ```
 cd research && claude --disallowedTools WebFetch WebSearch
@@ -227,5 +268,7 @@ The safety checks run by themselves when Claude Code's version changes, and each
 - DNS lookups from the container aren't filtered.
 - The container's login token is visible to the agent. It can only reach the Anthropic API and the allowed domains, and it can only make model requests. `commit-check` stops it being committed as plain text, but not encoded.
 - Research fetches can reach any website.
+- `convert-docs`'s sandbox limits each converter's time, but not its memory or disk use. A document made to blow up in size could fill either, though archives are refused if they'd unpack to more than 4 GB or 50,000 files.
+- Research can rewrite its own `CLAUDE.md`. A web page or document that misleads it could change the instructions every later research session starts with, though not what research is allowed to do. Read changes to it in `git diff` as you'd read the notes.
 - Opening `build/` with VS Code's Dev Containers extension uses `build/.devcontainer/devcontainer.json`. It mirrors `container.sh` but hasn't been tested, and may need the VS Code hosts uncommented in `allowed-domains.txt`.
 - Machines other than Linux. The scripts and the container's firewall have only been tested on Linux.

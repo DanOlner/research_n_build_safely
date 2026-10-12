@@ -1,0 +1,658 @@
+#!/bin/bash
+# Make text copies of the documents in research/sources/, so research sessions can search them and
+# re-read them cheaply. Research's SessionStart hook runs this, so documents you add are copied
+# when the next research session starts. You can also run it yourself, in this folder:
+#
+#   ./convert-docs                      copy every new or changed document in research/sources/
+#   ./convert-docs FILE|FOLDER ...      only these
+#   ./convert-docs ocr PDF ...          redo PDFs' text copies, reading scanned pages with OCR
+#   ./convert-docs pages PDF PAGES      images of PDF pages in two halves, for small print
+#   ./convert-docs images PDF           the pictures embedded in a PDF
+#   ./convert-docs compare OLD NEW      the wording that changed between two documents
+#   ./convert-docs export NOTE ... [--to docx|odt|pdf|html]    notes as documents, in exports/
+#
+# Documents can be named from this folder (research/sources/report.pdf) or from research/sources/
+# (report.pdf), and notes from research/notes/. "Working with documents" in the README lists what
+# each command makes and the packages it needs.
+#
+# Every converter runs inside bubblewrap (sudo apt install bubblewrap), with no network, a folder
+# of its own to write in, and nothing of yours to read but the one document it's converting.
+# Documents can be made to exploit bugs in converters, or to pull other files from your machine
+# into their text copies, which research reads. `./convert-docs self-check` tests the sandbox for
+# check.py.
+#
+# This script lives outside research/ and build/ on purpose: nothing the host runs should live
+# where an agent can write.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SOURCES="$(cd "$ROOT/research/sources" 2>/dev/null && pwd -P)" || SOURCES="$ROOT/research/sources"
+NOTES="$(cd "$ROOT/research/notes" 2>/dev/null && pwd -P)" || NOTES="$ROOT/research/notes"
+EXPORTS="$ROOT/exports"
+LIMIT=900          # seconds a converter may run
+HOOK_LIMIT=140     # the same, when research's SessionStart hook runs this
+HOOK_BUDGET=150    # seconds after which the hook starts no more conversions, leaving them for next time
+DPI=200            # for page images
+
+usage() { echo "Usage:" >&2; sed -n '6,12p' "$0" | sed 's/^#//' >&2; exit 1; }
+
+hook=false
+[ "${1-}" = --hook ] && { hook=true; shift; }
+action="${1-}"
+case "$action" in
+  ocr|pages|images|compare|export|self-check) shift ;;
+  -*) usage ;;
+  *) action=convert ;;
+esac
+if [ "$hook" = true ]; then
+  [ "$action" = convert ] && [ $# -eq 0 ] || usage
+  # A session check.py started, as part of a check that's already running: leave the documents.
+  [ -z "${DUAL_PROJECT_CHECK-}" ] || exit 0
+  LIMIT=$HOOK_LIMIT
+fi
+
+# One run at a time. The hook doesn't wait for another run: that one will do the work.
+exec 9>"$ROOT/.convert-docs.lock"
+if ! flock -n 9; then
+  [ "$hook" = true ] && exit 0
+  echo "Waiting for another convert-docs run to finish..." >&2
+  flock 9
+fi
+# Working folders sit in this folder, beside research/, so finished copies are moved into place
+# whole. Ones left by a run that was killed are removed.
+find "$ROOT" -maxdepth 1 -type d -name '.convert-docs.??????' -exec rm -rf -- {} +
+work="$(mktemp -d "$ROOT/.convert-docs.XXXXXX")" || exit 1
+trap 'rm -rf -- "$work"' EXIT
+
+report=()                        # what the hook says when a session starts
+say() { if [ "$hook" = true ]; then report+=("$*"); else echo "$*"; fi; }
+rel() { local p="${1#"$SOURCES"/}"; p="${p#"$NOTES"/}"; echo "${p#"$ROOT"/}"; }
+fresh() { mktemp -d "$work/out.XXXXXX"; }
+why() {  # the last line of a converter's messages that says something
+  grep -v -e '^[[:space:]]*$' -e javaldx -e '^convert /in/' "$work/log" 2>/dev/null | tail -n 1 | cut -c1-200
+}
+
+# The sandbox: system folders read-only, a private /tmp, no network, and new process, IPC and
+# user namespaces. Only the files named are visible, read-only, under /in.
+sysdirs=()
+for d in bin sbin lib lib32 lib64 libx32; do
+  if [ -L "/$d" ]; then sysdirs+=(--symlink "$(readlink "/$d")" "/$d")
+  elif [ -d "/$d" ]; then sysdirs+=(--ro-bind "/$d" "/$d"); fi
+done
+
+# jail OUT [FILE NAME]... -- COMMAND...   Run COMMAND in the sandbox, with each FILE readable as
+# /in/NAME and the folder OUT writable as /out, where it starts. Its messages are added to
+# $work/log, which each conversion empties first.
+jail() {
+  local out="$1" binds=()
+  shift
+  while [ "$1" != "--" ]; do binds+=(--ro-bind "$1" "/in/$2"); shift 2; done
+  shift
+  timeout -k 10 "$LIMIT" bwrap --unshare-all --die-with-parent --new-session \
+    --ro-bind /usr /usr --ro-bind /etc /etc "${sysdirs[@]}" \
+    --proc /proc --dev /dev --tmpfs /tmp "${binds[@]}" --bind "$out" /out --chdir /out \
+    --clearenv --setenv HOME /tmp --setenv PATH /usr/local/bin:/usr/bin:/bin --setenv LANG C.UTF-8 \
+    -- "$@" </dev/null 2>>"$work/log"
+  local status=$?
+  [ $status -ne 124 ] || echo "took longer than $LIMIT seconds" >>"$work/log"
+  return $status
+}
+
+# office OUT FILE NAME ARGS...   LibreOffice, with a profile of its own in the sandbox's /tmp.
+office() {
+  local out="$1" file="$2" name="$3"
+  shift 3
+  jail "$out" "$file" "$name" -- soffice --headless --norestore --nolockcheck \
+    -env:UserInstallation=file:///tmp/office "$@" --outdir /out "/in/$name" >>"$work/log"
+}
+
+ready=""
+sandbox_ready() {  # bubblewrap is installed and can start a sandbox; says why not, once
+  if [ -z "$ready" ]; then
+    if ! command -v bwrap >/dev/null; then
+      say "Documents weren't converted: bubblewrap isn't installed (sudo apt install bubblewrap)."
+      ready=no
+    elif ! jail "$(fresh)" -- true; then
+      say "Documents weren't converted: bubblewrap couldn't start a sandbox ($(why))."
+      ready=no
+    else
+      ready=yes
+    fi
+  fi
+  [ "$ready" = yes ]
+}
+
+# The converters must be in the system folders the sandbox can see.
+has() { PATH=/usr/local/bin:/usr/bin:/bin command -v "$1" >/dev/null; }
+package() { case "$1" in pdf*) echo poppler-utils ;; soffice) echo libreoffice ;; *) echo "$1" ;; esac; }
+missing() {  # TOOL...: prints "needs X (sudo apt install Y)" for the first one not installed
+  local t
+  for t in "$@"; do
+    has "$t" || { echo "needs $t (sudo apt install $(package "$t"))"; return 0; }
+  done
+  return 1
+}
+
+# How a file is copied, from its name. Office's lock files (~$report.docx, .~lock.report.docx#)
+# aren't documents.
+kind() {
+  local n="${1,,}"
+  case "${n##*/}" in '~$'*|.~lock.*) return ;; esac
+  case "$n" in
+    *.pdf) echo pdf ;;
+    *.docx|*.odt|*.rtf|*.epub|*.html|*.htm|*.xhtml) echo pandoc ;;
+    *.doc) echo doc ;;
+    *.pptx|*.ppt|*.ppsx|*.pps|*.odp) echo slides ;;
+    *.xlsx|*.xlsm|*.xls|*.ods) echo sheets ;;
+    *.zip) echo zip ;;
+    *.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz) echo tar ;;
+  esac
+}
+copy_of() {  # FILE KIND: where its copy goes
+  case "$2" in
+    pdf|slides) echo "$1.txt" ;;
+    pandoc|doc) echo "$1.md" ;;
+    sheets) echo "$1.sheets" ;;
+    zip|tar) echo "$1.files" ;;
+  esac
+}
+tools_for() {
+  case "$1" in
+    pdf) echo pdftotext pdfinfo ;;
+    pandoc) echo pandoc ;;
+    doc) echo soffice pandoc ;;
+    slides) echo soffice pdftotext ;;
+    sheets) echo soffice ;;
+    zip|tar) echo python3 ;;
+  esac
+}
+
+replace() {  # NEW DEST: put NEW in place of DEST, file or folder
+  if [ -d "$2" ] && [ ! -L "$2" ]; then mv -- "$2" "$(fresh)/old" || return 1; fi
+  mv -fT -- "$1" "$2"
+}
+
+# Number the pages of pdftotext's output, which ends each page with a form feed, with a
+# "--- LABEL N ---" line, appending to OUT. Prints the page count and how many have (almost) no text.
+paginate() {  # LABEL OUT
+  awk -v label="$1" -v out="$2" '
+    BEGIN { RS = "\f" }
+    { page[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        printf "--- %s %d ---\n%s\n", label, i, page[i] >> out
+        t = page[i]
+        gsub(/[[:space:]]/, "", t)
+        if (length(t) < 10) empty++
+      }
+      print NR, empty + 0
+    }'
+}
+
+# Each copy_KIND SRC DEST makes SRC's copy at DEST, setting $detail for the line it's reported on.
+detail=""
+scanned=()                       # PDFs with pages that have little or no text
+
+copy_pdf() {  # SRC DEST [ocr]
+  local pdf="$1" o counts info pages empty
+  o="$(fresh)"
+  if [ "${3-}" = ocr ]; then
+    jail "$o" "$1" source.pdf -- ocrmypdf --skip-text --output-type pdf --optimize 0 -q \
+      /in/source.pdf /out/ocr.pdf || return 1
+    pdf="$o/ocr.pdf"
+  fi
+  info="$(jail "$(fresh)" "$pdf" source.pdf -- pdfinfo /in/source.pdf |
+          grep -E '^(Title|Subject|Author|CreationDate|ModDate|Pages):[[:space:]]*[^[:space:]]')"
+  {
+    echo "--- PDF details ---"
+    [ -z "$info" ] || echo "$info"
+    [ "${3-}" != ocr ] || echo "OCR:          pages without text were read by OCR, so check figures against the PDF"
+  } >"$o/copy.txt"
+  counts="$(jail "$(fresh)" "$pdf" source.pdf -- pdftotext -layout -enc UTF-8 /in/source.pdf - |
+            paginate "PDF page" "$o/copy.txt")" || return 1
+  replace "$o/copy.txt" "$2" || return 1
+  read -r pages empty <<<"$counts"
+  detail=" ($pages page$([ "$pages" -eq 1 ] || echo s)"
+  if [ "$empty" -gt 0 ] && [ "${3-}" != ocr ]; then
+    detail+=", $empty with little or no text: blank or scanned"
+    scanned+=("$1")
+  fi
+  detail+=")"
+}
+
+copy_pandoc() {  # SRC DEST
+  local o ext format
+  o="$(fresh)"
+  ext="${1##*.}"
+  ext="${ext,,}"
+  case "$ext" in htm|xhtml) format=html ;; *) format="$ext" ;; esac
+  # --sandbox: pandoc reads nothing but the document, such as files it names for inclusion.
+  jail "$o" "$1" "source.$ext" -- pandoc --sandbox -f "$format" -t gfm --wrap=none \
+    -o /out/copy.md "/in/source.$ext" || return 1
+  replace "$o/copy.md" "$2"
+}
+
+copy_doc() {  # SRC DEST: old Word documents, through LibreOffice to .docx, then pandoc
+  local o
+  o="$(fresh)"
+  office "$o" "$1" source.doc --convert-to docx
+  [ -f "$o/source.docx" ] || return 1
+  copy_pandoc "$o/source.docx" "$2"
+}
+
+copy_slides() {  # SRC DEST: through LibreOffice to PDF, one page per slide
+  local o ext counts
+  o="$(fresh)"
+  ext="${1##*.}"
+  office "$o" "$1" "source.${ext,,}" --convert-to pdf
+  [ -f "$o/source.pdf" ] || return 1
+  : >"$o/copy.txt"
+  counts="$(jail "$(fresh)" "$o/source.pdf" source.pdf -- pdftotext -layout -enc UTF-8 /in/source.pdf - |
+            paginate slide "$o/copy.txt")" || return 1
+  replace "$o/copy.txt" "$2" || return 1
+  detail=" (${counts%% *} slide$([ "${counts%% *}" -eq 1 ] || echo s))"
+}
+
+copy_sheets() {  # SRC DEST: one CSV per sheet, values as displayed
+  local o ext f n=0
+  o="$(fresh)"
+  ext="${1##*.}"
+  # Comma-separated, UTF-8, values as shown, every sheet to its own file (source-SHEET.csv).
+  office "$o" "$1" "source.${ext,,}" \
+    --convert-to 'csv:Text - txt - csv (StarCalc):44,34,UTF8,1,,0,false,true,true,false,false,-1'
+  mkdir "$o/sheets"
+  for f in "$o"/source-*.csv; do
+    [ -e "$f" ] || continue
+    mv -- "$f" "$o/sheets/${f##*/source-}"
+    n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || return 1
+  replace "$o/sheets" "$2" || return 1
+  detail=" ($n sheet$([ "$n" -eq 1 ] || echo s))"
+}
+
+# Unpacks an archive inside the sandbox. No paths outside the folder, no links out of it, and no
+# CLAUDE.md, CLAUDE.local.md, AGENTS.md or .claude/, which Claude Code would load as instructions
+# when research reads files near them, or .git/, a repository git would act on.
+read -r -d '' UNPACK <<'PY'
+import os, sys, tarfile, zipfile
+kind, src, dest = sys.argv[1:4]
+MAX_BYTES, MAX_FILES = 4 * 1024**3, 50000
+LEFT_OUT = {"claude.md", "claude.local.md", "agents.md", ".claude", ".git"}
+
+def left_out(name):
+    return any(p.lower() in LEFT_OUT for p in name.replace("\\", "/").split("/"))
+
+def too_big(sizes):
+    if len(sizes) > MAX_FILES or sum(sizes) > MAX_BYTES:
+        sys.exit(f"would unpack {len(sizes)} files, {sum(sizes) / 1e9:.1f} GB, over the limit of "
+                 f"{MAX_FILES} files or {MAX_BYTES / 1e9:.0f} GB")
+
+def keep(member, path):
+    if left_out(member.name):
+        print(member.name)
+        return None
+    try:
+        return tarfile.data_filter(member, path)
+    except tarfile.FilterError:
+        print(member.name)
+        return None
+
+os.makedirs(dest)
+try:
+    if kind == "zip":
+        with zipfile.ZipFile(src) as z:
+            members = z.infolist()
+            too_big([m.file_size for m in members])
+            for m in members:
+                if left_out(m.filename):
+                    print(m.filename)
+                else:
+                    z.extract(m, dest)  # leaves out leading / and .. from names, and makes no links
+    else:
+        with tarfile.open(src) as t:
+            members = t.getmembers()
+            too_big([m.size for m in members])
+            t.extractall(dest, filter=keep)
+except Exception as e:
+    sys.exit(f"{type(e).__name__}: {e}")
+PY
+
+copy_archive() {  # SRC DEST KIND
+  local o n left
+  o="$(fresh)"
+  jail "$o" "$1" "source.$3" -- python3 -I -c "$UNPACK" "$3" "/in/source.$3" /out/files \
+    >"$o/left-out" || return 1
+  n="$(find "$o/files" -type f | wc -l)"
+  touch "$o/files"  # unpacking can give it the archive's date, so it would look out of date
+  replace "$o/files" "$2" || return 1
+  detail=" ($n file$([ "$n" -eq 1 ] || echo s)"
+  if [ -s "$o/left-out" ]; then
+    left="$(head -n 5 "$o/left-out" | paste -sd, - | sed 's/,/, /g')"
+    detail+="; left out $(wc -l <"$o/left-out"): $left"
+  fi
+  detail+=")"
+}
+copy_zip() { copy_archive "$1" "$2" zip; }
+copy_tar() { copy_archive "$1" "$2" tar; }
+
+converted=0 current=0 failed=0 skipped=0 later=0
+declare -A seen
+convert_one() {  # SRC [force]: copy SRC if its copy is missing or older than it
+  local src="$1" k dest need
+  k="$(kind "$src")"
+  [ -n "$k" ] && [ -z "${seen[$src]-}" ] || return 0
+  seen[$src]=1
+  dest="$(copy_of "$src" "$k")"
+  if [ "${2-}" != force ] && [ -e "$dest" ] && [ "$dest" -nt "$src" ]; then
+    current=$((current + 1))
+    return 0
+  fi
+  if [ "$hook" = true ] && [ "$SECONDS" -ge "$HOOK_BUDGET" ]; then
+    later=$((later + 1))
+    return 0
+  fi
+  # shellcheck disable=SC2046
+  if need="$(missing $(tools_for "$k"))"; then
+    say "Skipped    $(rel "$src"): $need"
+    skipped=$((skipped + 1))
+    return 0
+  fi
+  sandbox_ready || { skipped=$((skipped + 1)); return 0; }
+  detail=""
+  : >"$work/log"
+  if "copy_$k" "$src" "$dest"; then
+    say "Converted  $(rel "$src")$detail"
+    converted=$((converted + 1))
+  else
+    say "Failed     $(rel "$src"): $(why || true)"
+    failed=$((failed + 1))
+  fi
+}
+
+# resolve ARG BASE: ARG as a path from here or from BASE, which it must be in (or be). Prints it
+# with its folders' links resolved, but not a link at the end, which stays where the user put it.
+resolve() {
+  local arg="$1" base="$2" dir name
+  [ -e "$arg" ] || [ -L "$arg" ] || arg="$base/$1"
+  if ! [ -e "$arg" ] && ! [ -L "$arg" ]; then
+    echo "Not found: $1" >&2
+    return 1
+  fi
+  if [ -d "$arg" ] && [ ! -L "$arg" ]; then
+    dir="$(cd -- "$arg" && pwd -P)" && name=""
+  else
+    dir="$(cd -- "$(dirname -- "$arg")" && pwd -P)" && name="/$(basename -- "$arg")"
+  fi
+  case "$dir$name/" in
+    "$base"/*) [ "$name" != /. ] && [ "$name" != /.. ] && echo "$dir$name" && return 0 ;;
+  esac
+  echo "Not in $(rel "$base")/: $1" >&2
+  return 1
+}
+
+# Folders where Claude Code would load instructions: warn about any the user put in sources/.
+instructions() {
+  local f
+  while IFS= read -r -d '' f; do
+    say "Warning    $(rel "$f") would be loaded as instructions when research reads files near it: rename or remove it"
+  done < <(find "$SOURCES" \( -iname CLAUDE.md -o -iname CLAUDE.local.md -o -iname AGENTS.md \
+                              -o -name .claude \) -print0 2>/dev/null)
+}
+
+convert_all() {  # [FILE|FOLDER]...
+  local roots=() a f round before
+  for a in "$@"; do roots+=("$(resolve "$a" "$SOURCES")") || exit 1; done
+  [ ${#roots[@]} -gt 0 ] || roots=("$SOURCES")
+  [ -d "$SOURCES" ] || { say "No folder $(rel "$SOURCES")"; return 1; }
+  scan() { find "${roots[@]}" \( -type f -o -type l \) -print0 2>/dev/null | sort -z; }
+  # Archives first, so their documents are copied in the same run; archives in archives too.
+  for round in 1 2 3; do
+    before=$converted
+    while IFS= read -r -d '' f; do
+      case "$(kind "$f")" in zip|tar) convert_one "$f" ;; esac
+    done < <(scan)
+    [ "$converted" -gt "$before" ] || break
+  done
+  while IFS= read -r -d '' f; do convert_one "$f"; done < <(scan)
+  instructions
+  if [ "${#scanned[@]}" -gt 0 ]; then
+    say "To read scanned pages with OCR: ./convert-docs ocr$(printf ' "%s"' "${scanned[@]#"$SOURCES"/}")"
+  fi
+  [ "$later" -eq 0 ] || say "$later more to convert: run ./convert-docs in the project folder, or start research again"
+  if [ "$hook" = false ]; then
+    if [ $((converted + current + failed + skipped)) -eq 0 ]; then
+      echo "No documents in $(rel "${roots[0]}")/"
+    else
+      echo "$converted converted, $current already up to date, $failed failed, $skipped skipped"
+    fi
+  fi
+  [ "$failed" -eq 0 ]
+}
+
+ocr() {  # PDF...: redo text copies with OCR
+  [ $# -gt 0 ] || usage
+  local a src
+  has ocrmypdf || { echo "ocr needs ocrmypdf: sudo apt install ocrmypdf" >&2; exit 1; }
+  for a in "$@"; do
+    src="$(resolve "$a" "$SOURCES")" || exit 1
+    [ "$(kind "$src")" = pdf ] || { echo "Not a PDF: $a" >&2; exit 1; }
+    sandbox_ready || exit 1
+    : >"$work/log"
+    echo "Reading $(rel "$src") with OCR..."
+    if copy_pdf "$src" "$src.txt" ocr; then
+      echo "Converted  $(rel "$src")$detail"
+    else
+      echo "Failed     $(rel "$src"): $(why || true)"
+      failed=$((failed + 1))
+    fi
+  done
+  [ "$failed" -eq 0 ]
+}
+
+page_list() {  # "3,7,12-14" -> "3 7 12 13 14"
+  local part parts out=() i a b
+  IFS=, read -ra parts <<<"$1"
+  for part in "${parts[@]}"; do
+    if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
+    elif [[ $part =~ ^[0-9]+$ ]]; then a=$((10#$part)) b=$a
+    else return 1; fi
+    for ((i = a; i <= b; i++)); do out+=("$i"); done
+  done
+  [ ${#out[@]} -gt 0 ] && echo "${out[@]}"
+}
+
+pages() {  # PDF PAGES: each page in two overlapping halves, across its longer side
+  [ $# -eq 2 ] || usage
+  local src list p size w h o half made=()
+  src="$(resolve "$1" "$SOURCES")" || exit 1
+  [ "$(kind "$src")" = pdf ] || { echo "Not a PDF: $1" >&2; exit 1; }
+  list="$(page_list "$2")" || { echo "Pages should look like 12, 12-14 or 3,7,12-14" >&2; exit 1; }
+  missing pdftoppm pdfinfo >&2 && exit 1
+  sandbox_ready || exit 1
+  for p in $list; do
+    o="$(fresh)"
+    # Page size in pixels at $DPI, turned if the page is shown rotated.
+    size="$(jail "$o" "$src" source.pdf -- pdfinfo -f "$p" -l "$p" /in/source.pdf | awk -v dpi="$DPI" '
+      /^Page +[0-9]+ size: / { w = $4; h = $6 } /^Page +[0-9]+ rot: / { r = $NF }
+      END { if (w == "") exit 1; if (r % 180) { t = w; w = h; h = t }
+            printf "%d %d", w * dpi / 72 + 0.5, h * dpi / 72 + 0.5 }')" || {
+      echo "No page $p in $(rel "$src")" >&2; exit 1; }
+    read -r w h <<<"$size"
+    # Each half is 55% of the page, so a line across the middle appears whole in one of them.
+    if [ "$h" -ge "$w" ]; then
+      half=$((h * 55 / 100))
+      set -- top "-x 0 -y 0 -W $w -H $half" bottom "-x 0 -y $((h - half)) -W $w -H $half"
+    else
+      half=$((w * 55 / 100))
+      set -- left "-x 0 -y 0 -W $half -H $h" right "-x $((w - half)) -y 0 -W $half -H $h"
+    fi
+    while [ $# -gt 0 ]; do
+      # shellcheck disable=SC2086
+      jail "$o" "$src" source.pdf -- pdftoppm -f "$p" -l "$p" -r "$DPI" -png -singlefile $2 \
+        /in/source.pdf "/out/$1" && [ -f "$o/$1.png" ] || { echo "Failed: page $p: $(why)" >&2; exit 1; }
+      mv -f -- "$o/$1.png" "$src.page-$p-$1.png"
+      made+=("$(rel "$src.page-$p-$1.png")")
+      shift 2
+    done
+  done
+  printf 'Made       %s\n' "${made[@]}"
+}
+
+images() {  # PDF: the pictures embedded in it, named by page
+  [ $# -eq 1 ] || usage
+  local src o n
+  src="$(resolve "$1" "$SOURCES")" || exit 1
+  [ "$(kind "$src")" = pdf ] || { echo "Not a PDF: $1" >&2; exit 1; }
+  missing pdfimages >&2 && exit 1
+  sandbox_ready || exit 1
+  o="$(fresh)"
+  mkdir "$o/images"
+  jail "$o/images" "$src" source.pdf -- pdfimages -png -p /in/source.pdf /out/page ||
+    { echo "Failed: $(why)" >&2; exit 1; }
+  n="$(find "$o/images" -type f | wc -l)"
+  replace "$o/images" "$src.images" || exit 1
+  echo "Saved      $n picture$([ "$n" -eq 1 ] || echo s) from $(rel "$src") in $(rel "$src.images")/ (page-012-003.png is on page 12)"
+}
+
+text_of() {  # SRC: the text to compare for it: its copy, or itself if it's text already
+  local k
+  k="$(kind "$1")"
+  case "$k" in
+    pdf|slides|pandoc|doc)
+      [ -f "$(copy_of "$1" "$k")" ] && { copy_of "$1" "$k"; return 0; }
+      echo "No text copy of $(rel "$1"), and it couldn't be made" >&2; return 1 ;;
+    "") case "${1,,}" in *.txt|*.md|*.csv|*.tsv) echo "$1"; return 0 ;; esac ;;
+  esac
+  echo "Can't compare $(rel "$1"): only documents with a text copy, and text files" >&2
+  return 1
+}
+
+compare() {  # OLD NEW: the wording that changed, word by word, with the page of each change
+  [ $# -eq 2 ] || usage
+  local a b ta tb o out status
+  a="$(resolve "$1" "$SOURCES")" && b="$(resolve "$2" "$SOURCES")" || exit 1
+  missing git >&2 && exit 1
+  convert_one "$a"
+  convert_one "$b"
+  ta="$(text_of "$a")" && tb="$(text_of "$b")" || exit 1
+  sandbox_ready || exit 1
+  o="$(fresh)"
+  out="$(dirname -- "$a")/$(basename -- "$a").vs.$(basename -- "$b").diff"
+  # Without the details at the top of PDFs' copies, whose dates would show as changes.
+  strip() { awk 'NR == 1 && /^--- PDF details ---$/ { skip = 1 } skip && /^--- PDF page [0-9]+ ---$/ { skip = 0 } !skip' "$1"; }
+  strip "$ta" >"$work/old" && strip "$tb" >"$work/new" || exit 1
+  printf '* diff=copy\n' >"$work/attributes"
+  # The @@ line of each change repeats the last page or slide line above it in the old copy.
+  jail "$o" "$work/old" old "$work/new" new "$work/attributes" attributes -- git -c core.attributesFile=/in/attributes \
+    -c 'diff.copy.xfuncname=^(--- (PDF page|slide) [0-9]+ ---)$' \
+    diff --no-index --no-color --word-diff=plain /in/old /in/new >"$o/raw"
+  status=$?
+  [ $status -le 1 ] || { echo "Failed: $(why)" >&2; exit 1; }
+  {
+    echo "Changes in wording from $(rel "$a") to $(rel "$b"), word by word: [-old words-] {+new words+}."
+    echo "Each @@ line ends with the last page or slide line above the change in $(rel "$a")."
+    echo
+    if [ $status -eq 0 ]; then echo "No differences."; else sed '1,/^+++ /d' "$o/raw"; fi
+  } >"$o/diff"
+  replace "$o/diff" "$out" || exit 1
+  echo "Compared   $(rel "$a") with $(rel "$b"): $(rel "$out")$([ $status -eq 0 ] && echo ', no differences')"
+}
+
+export_notes() {  # NOTE... [--to FORMAT]: notes as documents in exports/
+  local to=docx notes=() a n o name dest
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) [ $# -ge 2 ] || usage; to="$2"; shift 2 ;;
+      --to=*) to="${1#--to=}"; shift ;;
+      -*) usage ;;
+      *) notes+=("$1"); shift ;;
+    esac
+  done
+  [ ${#notes[@]} -gt 0 ] || usage
+  case "$to" in odt|html) missing pandoc >&2 && exit 1 ;;
+                docx|pdf) missing pandoc soffice >&2 && exit 1 ;;
+                *) echo "Formats: docx, odt, pdf, html" >&2; exit 1 ;; esac
+  sandbox_ready || exit 1
+  # With --sandbox, pandoc can't read its own files for Word documents, but can for OpenDocument
+  # given its template. So notes become OpenDocument, and LibreOffice makes Word and PDF from that.
+  o="$(fresh)"
+  jail "$o" -- pandoc -o /out/reference.odt --print-default-data-file reference.odt ||
+    { echo "Failed: $(why)" >&2; exit 1; }
+  mv -- "$o/reference.odt" "$work/reference.odt"
+  # Pictures become their descriptions, so an export holds no file and links to no address.
+  echo 'function Image(el) return el.caption end' >"$work/pictures.lua"
+  for a in "${notes[@]}"; do
+    n="$(resolve "$a" "$NOTES")" || exit 1
+    case "${n,,}" in *.md) ;; *) echo "Not a Markdown note: $a" >&2; exit 1 ;; esac
+    name="$(basename -- "$n")"
+    name="${name%.*}"
+    dest="$(dirname -- "${n#"$NOTES"/}")"
+    dest="$EXPORTS/${dest#.}/$name.$to"
+    dest="${dest/\/\///}"
+    o="$(fresh)"
+    : >"$work/log"
+    # Notes come from research, which reads the web, so leave out raw HTML and LaTeX, and with
+    # --sandbox, pandoc reads nothing but the note, its template and the pictures filter.
+    jail "$o" "$n" note.md "$work/reference.odt" reference.odt "$work/pictures.lua" pictures.lua -- \
+      pandoc --sandbox -f markdown-raw_html-raw_tex-raw_attribute -s -M pagetitle="$name" \
+      --reference-doc /in/reference.odt --lua-filter /in/pictures.lua \
+      -o "/out/note.$([ "$to" = html ] && echo html || echo odt)" /in/note.md || {
+      echo "Failed     $(rel "$n"): $(why)" >&2; failed=$((failed + 1)); continue; }
+    case "$to" in docx|pdf)
+      office "$o" "$o/note.odt" note.odt --convert-to "$to"
+      [ -f "$o/note.$to" ] || { echo "Failed     $(rel "$n"): $(why)" >&2; failed=$((failed + 1)); continue; } ;;
+    esac
+    mkdir -p -- "$(dirname -- "$dest")" && mv -f -- "$o/note.$to" "$dest" || exit 1
+    echo "Exported   $(rel "$n") -> $(rel "$dest")"
+  done
+  [ "$failed" -eq 0 ]
+}
+
+self_check() {  # for check.py: each line is ok|bad, a tab, and what was checked
+  local o
+  if ! command -v bwrap >/dev/null; then
+    printf 'bad\tconverters run in a sandbox (install bubblewrap: sudo apt install bubblewrap)\n'
+    return
+  fi
+  o="$(fresh)"
+  echo check >"$work/probe"
+  chk() {
+    if jail "$o" "$work/probe" probe -- sh -c "$2" >/dev/null; then printf 'ok\t%s\n' "$1"
+    else printf 'bad\t%s\n' "$1"; fi
+  }
+  chk "converters run in a sandbox" "grep -q check /in/probe"
+  chk "converters can't see your home folder" "[ ! -e '$HOME' ] && [ ! -e /home ] && [ ! -e /root ]"
+  chk "converters can't see this project" "[ ! -e '$ROOT' ]"
+  chk "converters can't change the document they read" "! echo x >>/in/probe"
+  chk "converters can't reach Docker" "[ ! -e /var/run/docker.sock ] && [ ! -e /run/docker.sock ]"
+  chk "converters can't reach the network" "python3 -I -c '
+import socket
+try:
+    socket.create_connection((\"1.1.1.1\", 443), 3)
+except OSError:
+    raise SystemExit(0)
+raise SystemExit(1)'"
+}
+
+case "$action" in
+  convert) convert_all "$@" ;;
+  ocr) ocr "$@" ;;
+  pages) pages "$@" ;;
+  images) images "$@" ;;
+  compare) compare "$@" ;;
+  export) export_notes "$@" ;;
+  self-check) self_check ;;
+esac
+status=$?
+
+# The hook's message, shown when a research session starts, only when there's something to say.
+if [ "$hook" = true ] && [ ${#report[@]} -gt 0 ]; then
+  {
+    echo "convert-docs, for the documents in research/sources/:"
+    printf '  %s\n' "${report[@]:0:12}"
+    [ ${#report[@]} -le 12 ] || echo "  and $(( ${#report[@]} - 12 )) more: run ./convert-docs to see them"
+  } | python3 -c 'import json, sys; print(json.dumps({"systemMessage": sys.stdin.read().rstrip()}))'
+  exit 0
+fi
+exit $status

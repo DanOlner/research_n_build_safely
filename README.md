@@ -29,9 +29,10 @@ my-project/          one git repository: what you commit and push
   .gitignore         keeps the documents in research/sources/ out of git
   container.sh       start, use and stop the build container
   check.py           the safety checks: run after setup; they rerun by themselves after updates
-  pdf-text           text copies of the PDFs in research/sources/
-  research-gate      reruns the research checks after Claude Code updates (called by research's hooks)
+  convert-docs       text copies of the documents in research/sources/, made when research starts; also OCR, page images, comparisons and exporting notes
+  research-gate      reruns the research checks after Claude Code updates, and guards research's CLAUDE.md (called by research's hooks)
   commit-check       git pre-commit hook: refuses commits that add an Anthropic token or API key
+  exports/           notes exported as documents by convert-docs; not in git, not visible to either agent
   convos             with --convos: converts research's and the build agent's conversations (run by hooks)
   scripts/           with --convos: the export_all_convos scripts
   llm_convos/        with --convos: not visible to either agent
@@ -39,9 +40,9 @@ my-project/          one git repository: what you commit and push
     build/           the build agent's, the same way
   .github/workflows/publish-docs.yml   with --pages: publishes build/docs/ to GitHub Pages
   research/
-    .claude/settings.json   the research profile: no shell, writes only to notes/, no skip-permissions
-    CLAUDE.md
-    sources/         PDFs you add, and their text copies; not in git, not visible to the container
+    .claude/settings.json   the research profile: no shell, writes only to notes/ and CLAUDE.md, no skip-permissions
+    CLAUDE.md        research's instructions and the project spec, which research can edit
+    sources/         documents you add, and their text copies; not in git, not visible to the container
     notes/           mounted read-only into the container at /notes
   build/             the build agent's workspace, mounted into the container at /workspace
     CLAUDE.md
@@ -55,9 +56,11 @@ my-project/          one git repository: what you commit and push
 Research side:
 
 - No shell or subagent tools. Your claude.ai connectors (Gmail, Drive and so on) aren't loaded, and connector tools are denied as a second layer.
-- Reads limited to the folder; writes only to `notes/`.
+- Reads limited to the folder; writes only to `notes/` and its own `CLAUDE.md`, so you can build up the project spec with it.
+- `research-gate` refuses any change to that `CLAUDE.md` that adds or alters a line with an `@` in it, since `@path` would load a file into every session, past the read limits. Research can't create `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md` or `.claude/` in `notes/`, where Claude Code would load them as instructions.
 - Starts in `dontAsk` mode, and refuses skip-permissions and auto mode.
 - No git status snapshot in its sessions, so it never sees the names of files the build agent creates.
+- Documents in `sources/` are converted to text by `convert-docs`, on your machine rather than by research. Each converter runs inside bubblewrap, with no network and nothing of yours to read but its one document. Archives are unpacked without paths or links out of their folder, and without files Claude Code would load as instructions.
 - After a Claude Code update, the research checks run once when a session starts, and research is paused if they fail.
 
 Build container:

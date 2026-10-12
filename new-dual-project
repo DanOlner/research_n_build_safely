@@ -91,7 +91,7 @@ git -C "$target" init -q
 # Refuses commits that add an Anthropic token or API key. A link rather than a copy, so it always
 # runs the project's own commit-check.
 ln -s ../../commit-check "$target/.git/hooks/pre-commit"
-chmod +x "$target/container.sh" "$target/check.py" "$target/pdf-text" "$target/research-gate" "$target/commit-check"
+chmod +x "$target/container.sh" "$target/check.py" "$target/convert-docs" "$target/research-gate" "$target/commit-check"
 
 echo "Created $target with stacks: $stacks"
 [ "$convos" = false ] || echo "Conversations from research and build will be kept in $target/llm_convos/"
@@ -100,6 +100,11 @@ echo
 echo "Next steps (details in $target/README.md):"
 [ -f "$HOME/.config/claude-container/token.env" ] ||
   echo "  0. Save a container login token: see 'First-time setup' in the README"
+missing=""
+for t in bwrap:bubblewrap pdftotext:poppler-utils pandoc:pandoc soffice:libreoffice; do
+  command -v "${t%%:*}" >/dev/null || missing+=" ${t#*:}"
+done
+[ -z "$missing" ] || echo "  0. Install the document tools: sudo apt install$missing"
 echo "  1. cd $target/research && claude     accept the trust dialog, then type /exit"
 echo "  2. cd $target && ./container.sh build"
 echo "  3. ./check.py                        every line should say PASS"

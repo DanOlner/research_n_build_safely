@@ -12,3 +12,7 @@
 # research sessions running the checks at once.
 /.research-check-failed
 /.research-check.lock
+
+# convert-docs: notes exported as documents, and its lock and working folders.
+/exports/
+/.convert-docs.*

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Runs research's safety checks automatically after Claude Code updates. Research's settings
-call it from two hooks:
+"""Runs research's safety checks automatically after Claude Code updates, and guards research's
+CLAUDE.md. Research's settings call it from three hooks:
 
   research-gate start    when a research session starts: if this Claude Code version hasn't
                          passed the research checks, run them once (about 10 seconds) and record
                          the result in VERSION
   research-gate prompt   before each prompt: refuse it while the checks are failing or unfinished
+  research-gate edit     before each file write: refuse a change to research/CLAUDE.md that adds
+                         or alters a line with an @ in it
 
 It lives in the project's top folder, outside research/ and build/, so neither agent can change it.
 """
@@ -21,6 +23,11 @@ ROOT = Path(__file__).resolve().parent
 FAILED = ROOT / ".research-check-failed"
 LOCK = ROOT / ".research-check.lock"
 REFUSED = "Prompts are refused until ./check.py --research-only --accept passes in the project folder."
+CLAUDE_MD = ROOT / "research" / "CLAUDE.md"
+# check.py looks for "into every research session" in this, as evidence the hook refused a change.
+AT_REFUSED = ("Research can't add an @ to CLAUDE.md, or change a line that has one: @ and a path "
+              "would load that file into every research session. Leave out the @, or ask the user "
+              "to make this change by hand.")
 
 
 def say(**fields):
@@ -91,7 +98,38 @@ def prompt():
     say(decision="block", reason=reason)
 
 
+def edit():
+    """Research may edit its CLAUDE.md, but @path there imports that file into every research
+    session, past the rules on what research may read. So lines with an @ must stay exactly as the
+    user wrote them, and research can't add new ones. Anything this can't check is refused."""
+    try:
+        call = json.load(sys.stdin)
+        args = call["tool_input"]
+        path = args.get("file_path") or args.get("notebook_path") or ""
+        if os.path.realpath(os.path.join(call.get("cwd", ""), path)) != os.path.realpath(CLAUDE_MD):
+            return
+        before = CLAUDE_MD.read_text() if CLAUDE_MD.exists() else ""
+        old, new = args.get("old_string", ""), args.get("new_string", "")
+        if call["tool_name"] == "Write":
+            after = args.get("content", "")
+        elif call["tool_name"] == "Edit" and old and old in before:
+            after = before.replace(old, new, -1 if args.get("replace_all") else 1)
+        elif call["tool_name"] == "Edit" and "@" not in before:
+            after = before + "\n" + new  # Claude Code matched old_string loosely, such as its quotes
+        else:
+            after = None
+        at_lines = lambda text: {l for l in text.splitlines() if "@" in l}
+        if after is not None and at_lines(after) <= at_lines(before):
+            return
+        reason = AT_REFUSED
+    except Exception as e:
+        reason = f"research-gate couldn't check this change to CLAUDE.md ({e}), so it's refused."
+    say(hookSpecificOutput={"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                            "permissionDecisionReason": reason})
+
+
 if __name__ == "__main__":
-    if os.environ.get("DUAL_PROJECT_CHECK"):
+    command = sys.argv[1]
+    if command != "edit" and os.environ.get("DUAL_PROJECT_CHECK"):
         sys.exit(0)  # a session check.py started, as part of a check that's already running
-    {"start": start, "prompt": prompt}[sys.argv[1]]()
+    {"start": start, "prompt": prompt, "edit": edit}[command]()

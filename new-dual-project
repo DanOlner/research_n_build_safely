@@ -91,7 +91,7 @@ git -C "$target" init -q
 # Refuses commits that add an Anthropic token or API key. A link rather than a copy, so it always
 # runs the project's own commit-check.
 ln -s ../../commit-check "$target/.git/hooks/pre-commit"
-chmod +x "$target/container.sh" "$target/check.py" "$target/convert-docs" "$target/research-gate" "$target/commit-check"
+chmod +x "$target/container.sh" "$target/check.py" "$target/convert-docs" "$target/fetch-data" "$target/research-gate" "$target/commit-check"
 
 echo "Created $target with stacks: $stacks"
 [ "$convos" = false ] || echo "Conversations from research and build will be kept in $target/llm_convos/"

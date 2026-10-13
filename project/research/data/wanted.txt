@@ -1,0 +1,5 @@
+# Data files for the build agent, which reads this folder at /data. Research lists each file here,
+# and the user runs ./fetch-data in the project folder to download them. A line is the file's https
+# address, then a space and the name to save it as, which can be left out when the address ends in
+# one. Lines starting with # are comments: above each file, say what it is, its licence, and the
+# page that describes it.

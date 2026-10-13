@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+"""Download the data files research asks for into research/data/, and record where each came from.
+
+Research lists the files it wants in research/data/wanted.txt, one https address per line, but it
+can't download them: its web tool reads pages without saving files, and it can't run commands. So
+you run this, in this folder:
+
+  ./fetch-data                      download what wanted.txt lists that isn't here yet, and any
+                                    recorded file that's missing, as in a new clone. It lists them
+                                    and asks first; --yes doesn't ask
+  ./fetch-data add FILE [ADDRESS]   record a file you downloaded yourself, copying it into
+                                    research/data/. Its record says "by hand": nothing checked
+                                    that it came from ADDRESS
+  ./fetch-data refresh NAME ...     download recorded files again, keeping the new version of any
+                                    that the publisher has changed
+  ./fetch-data self-check           test the sandbox and the refusals, for check.py
+
+Each file is saved exactly as the website served it, and research/data/fetched.tsv records its
+address, when it was fetched, its size and its SHA-256. Then convert-docs makes text copies of the
+spreadsheets, archives, compressed files and documents, in research/data-copies/. The build
+container reads research/data/ at /data and the copies at /data-copies, both read-only. "Data for
+the build agent" in the README has more.
+
+Research reads the web, so a misleading page could choose the addresses. Each download runs in
+bubblewrap, which sees system folders but not your home folder or this project, and writes only to
+an empty folder of its own. Only https addresses are fetched, and only from public internet
+addresses, checked again at every redirect, so nothing on this machine or your local network can
+be copied in for research to read. Whoever downloaded a file, these are refused: files over 4 GB,
+a web page in place of a data file, formats that run code when they're loaded, and archives that
+would unpack outside their folder, or that hold links, files Claude Code loads as instructions or
+a git repository.
+
+This script lives outside research/ and build/ on purpose: nothing the host runs should live where
+an agent can write.
+"""
+import datetime
+import fcntl
+import hashlib
+import http.client
+import io
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.parse
+import zipfile
+import zlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "research" / "data"
+WANTED = DATA / "wanted.txt"
+RECORD = DATA / "fetched.tsv"
+COLUMNS = ["file", "address", "final_address", "retrieved", "bytes", "sha256", "how"]
+MAX_BYTES = 4 * 1024**3   # a file, or what an archive unpacks to
+MAX_FILES = 50000         # in an archive
+TIME_LIMIT = 1800         # seconds a download may take
+TIMEOUT = 60              # seconds to wait for a server to answer or send more
+REDIRECTS = 10
+USER_AGENT = "fetch-data (downloads data files for a research project)"
+# Formats that run code when they're loaded: Python's pickle, which joblib, dill and PyTorch files
+# use, and R's saved objects.
+RUNS_CODE = {".pkl", ".pickle", ".joblib", ".dill", ".pt", ".pth", ".ckpt", ".rds", ".rda", ".rdata"}
+ARCHIVES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
+UNCHECKED = {".7z", ".rar"}   # archives whose contents this can't check, so they're refused
+# Claude Code loads the first four as instructions when it reads files near them, and git acts on
+# .git. The build agent unpacks archives in build/, where both would happen.
+LEFT_OUT = {"claude.md", "claude.local.md", "agents.md", ".claude", ".git"}
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,140}\.[A-Za-z0-9]{1,8}")
+JAILED = "/in/.fetch-data"    # where this script is, inside the sandbox
+changed = False               # whether a file was put in research/data/, so its copies need making
+
+
+class Refused(Exception):
+    """A download or a file that isn't kept, and why."""
+
+
+class Failed(Exception):
+    """A download that didn't work, such as a server that didn't answer."""
+
+
+def size(n):
+    n = float(n)
+    for unit in ("bytes", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def rel(path):
+    return os.path.relpath(path, ROOT)
+
+
+# What can be kept, by name.
+
+def format_problem(name):
+    """Why a file of this name isn't kept, because of its format, or None."""
+    suffixes = Path(name).suffixes
+    for s in suffixes:
+        if s.lower() in RUNS_CODE:
+            return f"{s} files run code when they're loaded"
+    if suffixes and suffixes[-1].lower() in UNCHECKED:
+        return f"what's in a {suffixes[-1]} archive can't be checked"
+    return None
+
+
+def name_problem(name):
+    """Why a file can't be kept in research/data/ under this name, or None."""
+    if not NAME.fullmatch(name):
+        return ("names have only letters, digits, '.', '-' and '_', start with a letter or digit, and end "
+                "in an extension, such as .csv")
+    if name.lower() in LEFT_OUT:
+        return "Claude Code would load it as instructions"
+    if name in (WANTED.name, RECORD.name):
+        return "that's the name of fetch-data's own file"
+    return format_problem(name)
+
+
+# Fetching, inside the sandbox.
+
+def split_address(url):
+    """The host, port and request target of an https address. Anything else is refused."""
+    if not url or any(c.isspace() or ord(c) < 32 for c in url):
+        raise Refused("that isn't a web address")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() != "https":
+        raise Refused(f"only https addresses are fetched, not {parts.scheme + ':' if parts.scheme else 'this'}")
+    if "@" in parts.netloc:
+        raise Refused("addresses with a user name or password in them aren't fetched")
+    try:
+        host, port = parts.hostname, parts.port or 443
+    except ValueError:
+        raise Refused("its port isn't a number")
+    if not host:
+        raise Refused("it has no website in it")
+    target = urllib.parse.quote(parts.path or "/", safe="/%:@!$&'()*+,;=~")
+    if parts.query:
+        target += "?" + urllib.parse.quote(parts.query, safe="/%:@!$&'()*+,;=~?")
+    return host, port, target
+
+
+def public_address(host, port):
+    """Where to connect to reach host. Refused unless every address it has is a public internet
+    address: not this machine, the local network, or a cloud server's own settings service."""
+    try:
+        found = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError) as e:
+        raise Failed(f"{host} wasn't found ({e})")
+    for *_, sockaddr in found:
+        ip = ipaddress.ip_address(sockaddr[0].split("%")[0])
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global or ip.is_multicast:
+            raise Refused(f"{host} is at {ip}, which isn't a public internet address")
+    return found[0][4]
+
+
+class Pinned(http.client.HTTPSConnection):
+    """An https connection to the address public_address checked. Looking the host up again
+    could give a different address."""
+    def __init__(self, host, port, sockaddr):
+        self.tls = ssl.create_default_context()
+        super().__init__(host, port, timeout=TIMEOUT, context=self.tls)
+        self.sockaddr = sockaddr
+
+    def connect(self):
+        sock = socket.create_connection(self.sockaddr[:2], self.timeout)
+        self.sock = self.tls.wrap_socket(sock, server_hostname=self.host)
+
+
+def open_https(url):
+    """A GET request for url, made once the address and where it leads have been checked."""
+    host, port, target = split_address(url)
+    conn = Pinned(host, port, public_address(host, port))
+    conn.request("GET", target, headers={"User-Agent": USER_AGENT, "Accept": "*/*",
+                                         "Accept-Encoding": "identity"})
+    return conn.getresponse()
+
+
+def body(response, unzip):
+    """The response's data in pieces, uncompressed a piece at a time if it came compressed."""
+    while chunk := response.read(1 << 20):
+        if unzip is None:
+            yield chunk
+            continue
+        while chunk:
+            yield unzip.decompress(chunk, 1 << 20)
+            chunk = unzip.unconsumed_tail
+
+
+shown = 0.0
+def progress(done, total):
+    global shown
+    if sys.stderr.isatty() and time.monotonic() - shown > 0.5:
+        shown = time.monotonic()
+        sys.stderr.write(f"\r  {size(done)}" + (f" of {size(total)}" if total else "") + "\033[K")
+        sys.stderr.flush()
+
+
+def download(url, out, name, opener=open_https, limit=MAX_BYTES):
+    """Fetch url into the file out, checking the address of every redirect through opener.
+    Returns the address the file came from in the end, and its type."""
+    for _ in range(REDIRECTS + 1):
+        response = opener(url)
+        if response.status not in (301, 302, 303, 307, 308):
+            break
+        location = response.getheader("Location")
+        response.close()
+        if not location:
+            raise Failed(f"the server redirected it ({response.status}) without saying where")
+        url = urllib.parse.urljoin(url, location)
+    else:
+        raise Failed(f"the server redirected it more than {REDIRECTS} times")
+    if response.status != 200:
+        raise Failed(f"the server answered {response.status} {response.reason}")
+    length = response.getheader("Content-Length") or ""
+    if length.isdigit() and int(length) > limit:
+        raise Refused(f"it's {size(int(length))}, over the limit of {size(limit)}")
+    encoding = (response.getheader("Content-Encoding") or "identity").strip().lower()
+    if encoding in ("gzip", "x-gzip"):
+        unzip = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    elif encoding == "identity":
+        unzip = None
+    else:
+        raise Failed(f"the server sent it compressed as {encoding}")
+    kind = (response.getheader("Content-Type") or "").partition(";")[0].strip().lower()
+    total, start = 0, b""
+    with open(out, "wb") as f:
+        for chunk in body(response, unzip):
+            total += len(chunk)
+            if total > limit:
+                raise Refused(f"it's over the limit of {size(limit)}")
+            start += chunk[:max(0, 512 - len(start))]
+            f.write(chunk)
+            progress(total, int(length) if length.isdigit() and unzip is None else None)
+    if shown:
+        sys.stderr.write("\r\033[K")
+    start = start.lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    page = kind in ("text/html", "application/xhtml+xml") or start.startswith((b"<!doctype html", b"<html"))
+    if page and not name.lower().endswith((".html", ".htm")):
+        raise Refused("the address gave a web page, not a data file: it may be a page about the file, "
+                      "a page with a download button, or a sign-in page")
+    return url, kind
+
+
+def archive_problem(path, name):
+    """Why an archive isn't kept, or None. The build agent unpacks archives in build/."""
+    n = name.lower()
+    if not n.endswith(ARCHIVES):
+        return None
+    members = []  # (name, size unpacked, what it is if it isn't a file or a folder)
+    try:
+        if n.endswith(".zip"):
+            with zipfile.ZipFile(path) as z:
+                for m in z.infolist():
+                    members.append((m.filename, m.file_size,
+                                    "a link" if stat.S_ISLNK(m.external_attr >> 16) else None))
+        else:
+            with tarfile.open(path) as t:
+                for m in t:
+                    other = (None if m.isfile() or m.isdir() else
+                             "a link" if m.issym() or m.islnk() else "a device or pipe")
+                    members.append((m.name, m.size, other))
+                    if len(members) > MAX_FILES:
+                        break
+    except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError, zlib.error) as e:
+        return f"it couldn't be read as an archive ({e})"
+    if len(members) > MAX_FILES or sum(s for _, s, _ in members) > MAX_BYTES:
+        return f"it would unpack to more than {MAX_FILES} files or {size(MAX_BYTES)}"
+    for member, _, other in members:
+        parts = member.replace("\\", "/").split("/")
+        if other:
+            return f"it holds {member}, which is {other}"
+        if member.startswith(("/", "\\")) or re.match(r"[A-Za-z]:", member) or ".." in parts:
+            return f"it holds {member}, which would unpack outside the archive's folder"
+        if ".git" in {p.lower() for p in parts}:
+            return f"it holds {member}, part of a git repository, which git would act on"
+        if {p.lower() for p in parts} & LEFT_OUT:
+            return f"it holds {member}, which Claude Code would load as instructions"
+        problem = format_problem(parts[-1])
+        if problem:
+            return f"it holds {member}, and {problem}"
+    return None
+
+
+def jailed(command, args):
+    """What runs inside the sandbox. Its answer is a line of JSON."""
+    if not os.path.isfile(JAILED):
+        sys.exit("This runs only inside fetch-data's sandbox.")
+    if command == "_self-check":
+        return jailed_self_check(*args)
+    try:
+        if command == "_get":
+            url, name = args
+            final, kind = download(url, f"/out/{name}", name)
+            answer = {"final_address": final, "type": kind}
+        elif command == "_inspect":
+            problem = archive_problem(f"/in/{args[0]}", args[0])
+            answer = {"refused": problem} if problem else {}
+        else:
+            answer = {"failed": f"unknown command {command}"}
+    except Refused as e:
+        answer = {"refused": str(e)}
+    except Failed as e:
+        answer = {"failed": str(e)}
+    except ssl.SSLCertVerificationError as e:
+        answer = {"failed": f"its website's certificate couldn't be checked ({e.verify_message})"}
+    except (TimeoutError, socket.timeout):
+        answer = {"failed": "the website stopped answering"}
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        answer = {"failed": f"{type(e).__name__}: {e}"}
+    print(json.dumps(answer))
+
+
+# The sandbox, from outside.
+
+def sysdirs():
+    """bubblewrap options for the system folders that are links on some systems, such as /bin."""
+    opts = []
+    for d in ("bin", "sbin", "lib", "lib32", "lib64", "libx32"):
+        p = Path("/") / d
+        if p.is_symlink():
+            opts += ["--symlink", os.readlink(p), str(p)]
+        elif p.is_dir():
+            opts += ["--ro-bind", str(p), str(p)]
+    return opts
+
+
+def jail(out, args, files=(), network=False, extra=(), show=False):
+    """Run this script with args in bubblewrap: system folders read-only, a private /tmp, each
+    (path, name) in files readable at /in/name, and the folder out writable as /out. Without
+    network it has none; with it, it has the host's, and DNS. Returns its answer."""
+    cmd = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session"]
+    if network:
+        # /etc/resolv.conf may point into /run, where systemd's DNS resolver is.
+        cmd += ["--share-net", "--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve"]
+    cmd += ["--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc", *sysdirs(), *extra,
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--ro-bind", str(Path(__file__).resolve()), JAILED]
+    for path, name in files:
+        cmd += ["--ro-bind", str(path), f"/in/{name}"]
+    cmd += ["--bind", str(out), "/out", "--chdir", "/out", "--clearenv", "--setenv", "HOME", "/tmp",
+            "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin", "--setenv", "LANG", "C.UTF-8",
+            "--", "python3", "-I", JAILED, *args]
+    try:
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=None if show else subprocess.PIPE, text=True, timeout=TIME_LIMIT)
+    except FileNotFoundError:
+        return {"failed": "bubblewrap isn't installed (sudo apt install bubblewrap)"}
+    except subprocess.TimeoutExpired:
+        return {"failed": f"it took longer than {TIME_LIMIT} seconds"}
+    if args[0] == "_self-check":
+        return p
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        why = (p.stderr or "").strip().splitlines()
+        return {"failed": f"the sandbox didn't start ({why[-1][:200] if why else f'exit code {p.returncode}'})"}
+
+
+def fetch_one(work, name, address):
+    """Download address as name into a new folder in work, and check it. Returns the file and the
+    address it came from in the end."""
+    out = Path(tempfile.mkdtemp(dir=work))
+    answer = jail(out, ["_get", address, name], network=True, show=sys.stderr.isatty())
+    if "refused" in answer:
+        raise Refused(answer["refused"])
+    if "failed" in answer:
+        raise Failed(answer["failed"])
+    file = out / name
+    check_file(file, name, work)
+    return file, answer["final_address"]
+
+
+def check_file(file, name, work):
+    """Refused if the file isn't kept. Archives are looked inside in the sandbox, without network."""
+    if name.lower().endswith(ARCHIVES):
+        answer = jail(Path(tempfile.mkdtemp(dir=work)), ["_inspect", name], files=[(file, name)])
+        if answer:
+            raise Refused(answer.get("refused") or f"its contents couldn't be checked: {answer.get('failed')}")
+
+
+# The record and the list.
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_record():
+    """fetched.tsv's lines, each a dict keyed by COLUMNS."""
+    if not RECORD.exists():
+        return []
+    lines = RECORD.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        return []
+    if lines[0].split("\t") != COLUMNS:
+        sys.exit(f"{rel(RECORD)} should start with these names, with tabs between: {' '.join(COLUMNS)}")
+    entries = []
+    for number, line in enumerate(lines[1:], 2):
+        if line.strip():
+            values = line.split("\t")
+            if len(values) != len(COLUMNS):
+                sys.exit(f"{rel(RECORD)} line {number} should have {len(COLUMNS)} values, with tabs between")
+            entries.append(dict(zip(COLUMNS, values)))
+    return entries
+
+
+def put(file, name):
+    """Move a downloaded or added file into research/data/."""
+    global changed
+    os.replace(file, DATA / name)
+    changed = True
+
+
+def make_copies():
+    """Text copies of what's new in research/data/, by convert-docs, as when research starts."""
+    script = ROOT / "convert-docs"
+    if script.exists():
+        print("\nconvert-docs, for research/data/:", flush=True)
+        subprocess.run([str(script), str(DATA)])
+
+
+def write_record(entries, work):
+    tmp = work / RECORD.name
+    tmp.write_text("\t".join(COLUMNS) + "\n" + "".join("\t".join(e[c] for c in COLUMNS) + "\n" for e in entries),
+                   encoding="utf-8")
+    os.replace(tmp, RECORD)
+
+
+def entry(name, address, file, final="", how="fetched"):
+    return {"file": name, "address": address, "final_address": final if final != address else "",
+            "retrieved": now(), "bytes": str(file.stat().st_size), "sha256": sha256(file), "how": how}
+
+
+def read_wanted():
+    """(line number, address, name, problem) for each file wanted.txt lists."""
+    if not WANTED.exists():
+        return
+    for number, line in enumerate(WANTED.read_text(encoding="utf-8").splitlines(), 1):
+        words = line.split()
+        for i, word in enumerate(words):
+            if word.startswith("#"):
+                words = words[:i]
+                break
+        if not words:
+            continue
+        address, name = words[0], words[1] if len(words) > 1 else ""
+        try:
+            host = split_address(address)[0]
+            try:  # an address given as numbers can be refused now; names are looked up in the sandbox
+                ip = ipaddress.ip_address(host)
+            except ValueError:
+                ip = None
+            if ip and (not ip.is_global or ip.is_multicast or (ip.version == 6 and ip.ipv4_mapped)):
+                raise Refused(f"{host} isn't a public internet address")
+        except Refused as e:
+            yield number, address, name, str(e)
+            continue
+        if len(words) > 2:
+            yield number, address, name, "a line has an address, then a space and a name, and nothing more"
+            continue
+        if not name:
+            name = urllib.parse.unquote(urllib.parse.urlsplit(address).path.rsplit("/", 1)[-1])
+            if not NAME.fullmatch(name):
+                yield number, address, "", "the address doesn't end in a file name: add a name after it"
+                continue
+        problem = name_problem(name)
+        yield number, address, name, problem and f"{name}: {problem}"
+
+
+def unrecorded(recorded):
+    """Warnings about what's in research/data/ that fetch-data didn't put there or record."""
+    notes = []
+    for p in sorted(DATA.iterdir()):
+        if p.name in (WANTED.name, RECORD.name, ".gitkeep") or (p.name in recorded and p.is_file()
+                                                                and not p.is_symlink()):
+            continue
+        if p.is_symlink():
+            notes.append(f"{rel(p)} is a link, and research would read what it points to: "
+                         "replace it with the file itself")
+        elif p.is_dir():
+            notes.append(f"{rel(p)}/ is a folder, which fetch-data doesn't record, so a clone won't have it")
+        else:
+            notes.append(f"{rel(p)} isn't recorded, so a clone won't have it: "
+                         f"run ./fetch-data add {rel(p)} [ADDRESS]")
+    for folder, dirs, files in os.walk(DATA):
+        for n in dirs + files:
+            if n.lower() == ".git":
+                notes.append(f"{rel(Path(folder) / n)} is part of a git repository, which git would act on: remove it")
+            elif n.lower() in LEFT_OUT:
+                notes.append(f"{rel(Path(folder) / n)} would be loaded as instructions when research "
+                             "reads files near it: remove it")
+    return notes
+
+
+# The commands.
+
+class Run:
+    """The lock that keeps to one run at a time, and a working folder beside research/, so files
+    are moved into place whole. Working folders left by a run that was killed are removed."""
+    def __enter__(self):
+        self.lock = open(ROOT / ".fetch-data.lock", "w")
+        try:
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Waiting for another fetch-data run to finish...", file=sys.stderr)
+            fcntl.flock(self.lock, fcntl.LOCK_EX)
+        for old in ROOT.glob(".fetch-data.*"):
+            if old.is_dir() and not old.is_symlink():
+                shutil.rmtree(old, ignore_errors=True)
+        self.work = Path(tempfile.mkdtemp(prefix=".fetch-data.", dir=ROOT))
+        return self.work
+
+    def __exit__(self, *_):
+        shutil.rmtree(self.work, ignore_errors=True)
+        self.lock.close()
+
+
+def fetch(ask):
+    if not DATA.is_dir():
+        sys.exit(f"No folder {rel(DATA)}")
+    with Run() as work:
+        return fetch_all(ask, work)
+
+
+def fetch_all(ask, work):
+    record = read_record()
+    recorded = {e["file"]: e for e in record}
+    problems, todo, listed = [], [], {}
+    for number, address, name, problem in read_wanted():
+        where = f"{rel(WANTED)} line {number}"
+        if problem:
+            problems.append(f"{where}: {problem}")
+        elif name in listed:
+            problems.append(f"{where}: {name} is on line {listed[name]} already")
+        elif name in recorded:
+            listed[name] = number
+            if recorded[name]["address"] != address:
+                problems.append(f"{where}: {name} is recorded already, from "
+                                f"{recorded[name]['address'] or 'no address'}: give this one another name")
+        elif (DATA / name).exists() or (DATA / name).is_symlink():
+            listed[name] = number
+            problems.append(f"{where}: {rel(DATA / name)} is there already, but isn't recorded: record it "
+                            "with ./fetch-data add, or give this one another name")
+        else:
+            listed[name] = number
+            todo.append((name, address, None))
+    for e in record:
+        if (DATA / e["file"]).exists():
+            continue
+        problem = name_problem(e["file"])
+        if problem:
+            problems.append(f"{rel(RECORD)} lists {e['file']}, which isn't kept: {problem}")
+        elif not e["address"]:
+            problems.append(f"{e['file']} is recorded, but missing, and was added by hand with no address: "
+                            "add it again with ./fetch-data add FILE")
+        else:
+            todo.append((e["file"], e["address"], e))
+    for note in unrecorded(recorded):
+        print(f"Note       {note}")
+    for problem in problems:
+        print(f"Problem    {problem}")
+    if not todo:
+        print("Nothing to download." if problems else
+              f"Nothing to download: {rel(WANTED)} lists no files yet." if not record else
+              f"Nothing to download: the {len(record)} recorded file{'' if len(record) == 1 else 's'} "
+              f"{'is' if len(record) == 1 else 'are'} here.")
+        return 1 if problems else 0
+    width = max(len(name) for name, _, _ in todo)
+    print("\nTo download into research/data/:")
+    for name, address, e in todo:
+        why = f"recorded {e['retrieved'][:10]}" if e else "new"
+        print(f"  {name:<{width}}  {why}, from {urllib.parse.urlsplit(address).hostname}\n  {'':<{width}}  {address}")
+    if any(e is None for _, _, e in todo):
+        print("Research listed the new ones. Check each comes from a website you'd expect.")
+    if ask:
+        if not sys.stdin.isatty():
+            print("Run ./fetch-data --yes to download them without being asked.")
+            return 1
+        try:
+            if input("Download them? [y/N] ").strip().lower() not in ("y", "yes"):
+                return 1
+        except EOFError:
+            return 1
+    done = bad = 0
+    for name, address, e in todo:
+        try:
+            file, final = fetch_one(work, name, address)
+        except Refused as err:
+            print(f"Refused    {name}: {err}")
+            bad += 1
+            continue
+        except Failed as err:
+            print(f"Failed     {name}: {err}. If it opens in your browser, download it and run "
+                  f"./fetch-data add FILE {address}")
+            bad += 1
+            continue
+        new = entry(name, address, file, final)
+        if e is None:
+            put(file, name)
+            record.append(new)
+            write_record(record, work)
+            print(f"Fetched    {name} ({size(new['bytes'])}, from {urllib.parse.urlsplit(final).hostname})")
+            done += 1
+        elif new["sha256"] == e["sha256"]:
+            put(file, name)
+            print(f"Restored   {name} ({size(new['bytes'])}), the same as recorded on {e['retrieved'][:10]}")
+            done += 1
+        else:
+            print(f"Changed    {name}: the address now gives a different file from the one recorded on "
+                  f"{e['retrieved'][:10]}, so it wasn't kept. To use the new one: ./fetch-data refresh {name}")
+            bad += 1
+    print(f"{done} downloaded, {bad} not")
+    return 1 if bad or problems else 0
+
+
+def refresh(names):
+    bad = 0
+    with Run() as work:
+        record = read_record()
+        recorded = {e["file"]: e for e in record}
+        for name in (Path(n).name for n in names):
+            e = recorded.get(name)
+            if e is None or name_problem(name):
+                print(f"Skipped    {name}: it isn't recorded in {rel(RECORD)}")
+                bad += 1
+                continue
+            if not e["address"]:
+                print(f"Skipped    {name}: it was added by hand with no address. Add the new version with "
+                      "./fetch-data add, after deleting its line in fetched.tsv")
+                bad += 1
+                continue
+            try:
+                file, final = fetch_one(work, name, e["address"])
+            except (Refused, Failed) as err:
+                print(f"{'Refused' if isinstance(err, Refused) else 'Failed':<10} {name}: {err}")
+                bad += 1
+                continue
+            new = entry(name, e["address"], file, final)
+            if new["sha256"] == e["sha256"]:
+                if not (DATA / name).exists():
+                    put(file, name)
+                print(f"Unchanged  {name}: the same as recorded on {e['retrieved'][:10]}")
+                continue
+            put(file, name)
+            old = dict(e)
+            e.update(new)
+            write_record(record, work)
+            print(f"Updated    {name}: was {size(old['bytes'])}, recorded {old['retrieved'][:10]}, SHA-256 "
+                  f"{old['sha256'][:12]}...; now {size(new['bytes'])}, SHA-256 {new['sha256'][:12]}...")
+    return 1 if bad else 0
+
+
+def add(path, address):
+    global changed
+    src = Path(path).expanduser()
+    if not src.is_file():
+        sys.exit(f"Not a file: {path}")
+    name, dest = src.name, DATA / src.name
+    problem = name_problem(name)
+    if problem:
+        sys.exit(f"Refused    {name}: {problem}")
+    if address:
+        try:
+            split_address(address)
+        except Refused as e:
+            sys.exit(f"Refused    {address}: {e}")
+    if dest.is_symlink():
+        sys.exit(f"{rel(dest)} is a link: replace it with the file itself, then add that")
+    # A file already in research/data/ with the same contents is the one to record.
+    here = dest.exists() and (os.path.samefile(src, dest) or sha256(src) == sha256(dest))
+    if dest.exists() and not here:
+        sys.exit(f"{rel(dest)} exists already, with different contents: give this one another name")
+    with Run() as work:
+        record = read_record()
+        e = next((e for e in record if e["file"] == name), None)
+        file = dest if here else work / name
+        if not here:
+            shutil.copyfile(src, file)
+        try:
+            check_file(file, name, work)
+        except Refused as err:
+            sys.exit(f"Refused    {name}: {err}")
+        new = entry(name, address, file, how="by hand")
+        if e and e["sha256"] != new["sha256"]:
+            sys.exit(f"{name} is recorded already, with different contents: give this file another name, "
+                     f"or to replace that one, delete its line in {rel(RECORD)} first")
+        if not here:
+            put(file, name)
+        if e:
+            print(f"Unchanged  {name}: recorded already, on {e['retrieved'][:10]}" if here else
+                  f"Restored   {name}: the same as recorded on {e['retrieved'][:10]}")
+            return 0
+        record.append(new)
+        write_record(record, work)
+        changed = True
+    print(f"Added      {name} ({size(new['bytes'])}), recorded as added by hand, "
+          + (f"from {address}" if address else "with no address"))
+    return 0
+
+
+# check.py runs this. Each line printed is ok or bad, a tab, and what was checked.
+
+class Canned:
+    """A response from no server, for the checks."""
+    def __init__(self, status, headers=None, data=b""):
+        self.status, self.reason, self.data = status, "check", io.BytesIO(data)
+        self.headers = {k.lower(): v for k, v in (headers or {}).items()}
+
+    def getheader(self, name, default=None):
+        return self.headers.get(name.lower(), default)
+
+    def read(self, n=-1):
+        return self.data.read(n)
+
+    def close(self):
+        pass
+
+
+def say(ok, check, wrong=()):
+    print(f"{'ok' if ok else 'bad'}\t{check}" + ("" if ok or not wrong else f" (wrong for: {', '.join(wrong)})"))
+
+
+def jailed_self_check(home, root):
+    """The sandbox and the address checks, from inside the sandbox that downloads run in."""
+    global TIMEOUT
+    TIMEOUT = 5  # an address that should have been refused isn't waited on for long
+    say(True, "downloads run in a sandbox")
+    say(not any(os.path.exists(p) for p in (home, "/home", "/root")), "downloads can't see your home folder")
+    say(not os.path.exists(root), "downloads can't see this project")
+    say(not any(os.path.exists(p) for p in ("/var/run/docker.sock", "/run/docker.sock")),
+        "downloads can't reach Docker")
+
+    def refused(because, url, opener=open_https, name="check.csv", limit=MAX_BYTES):
+        try:
+            download(url, "/out/check", name, opener, limit)
+        except Refused as e:
+            return because in str(e)
+        except Exception:
+            return False
+        return False
+
+    def wrong(because, urls, **kw):
+        return [u for u in urls if not refused(because, u, **kw)]
+
+    w = wrong("https", ["file:///etc/passwd", "http://example.com/data.csv", "ftp://example.com/data.csv"])
+    w += wrong("user name", ["https://user:secret@example.com/data.csv", "https://user@example.com/data.csv"])
+    say(not w, "fetch-data fetches only https addresses, with no user name or password in them", w)
+    # check-private.example and check-mixed.example are in the /etc/hosts the self-check gives this
+    # sandbox: the first at a private address, the second at a public one and a private one.
+    hosts = ["localhost", "127.0.0.1", "[::1]", "0.0.0.0", "10.0.0.1", "172.16.0.1", "192.168.1.1",
+             "100.64.0.1", "169.254.169.254", "[fe80::1]", "[fd00::1]", "[::ffff:127.0.0.1]",
+             "check-private.example", "check-mixed.example"]
+    w = wrong("public internet address", [f"https://{h}/data.csv" for h in hosts])
+    say(not w, "fetch-data refuses addresses on this machine or the local network", w)
+    # The connection goes to the address that was checked, here a listener on this machine, not to
+    # wherever a second lookup of the name would lead: check-pin.invalid has no address at all.
+    listener = socket.create_server(("127.0.0.1", 0))
+    reached = threading.Event()
+    def answer():
+        listener.accept()[0].close()
+        reached.set()
+    threading.Thread(target=answer, daemon=True).start()
+    try:
+        Pinned("check-pin.invalid", 443, listener.getsockname()).connect()
+    except OSError:
+        pass
+    say(reached.wait(5), "fetch-data connects to the address it checked, without looking the website up again")
+    start = "https://check-public.example/data.csv"
+    w = []
+    for target, because in [("https://check-private.example/data.csv", "public internet address"),
+                            ("https://127.0.0.1:8080/data.csv", "public internet address"),
+                            ("http://example.com/data.csv", "https"), ("file:///etc/passwd", "https")]:
+        canned = {start: Canned(302, {"Location": target})}
+        if not refused(because, start, opener=lambda u: canned[u] if u in canned else open_https(u)):
+            w.append(target)
+    say(not w, "fetch-data checks the address at every redirect", w)
+    page = b"<!DOCTYPE html><title>Sign in</title>"
+    w = [n for n, r in [("text/html", Canned(200, {"Content-Type": "text/html"}, page)),
+                        ("text/plain", Canned(200, {"Content-Type": "text/plain"}, b"\n <html><p>Sign in"))]
+         if not refused("web page", start, opener=lambda u, r=r: r)]
+    try:
+        download(start, "/out/check", "page.html", lambda u: Canned(200, {"Content-Type": "text/html"}, page))
+    except Exception:
+        w.append("a page asked for as .html")
+    say(not w, "fetch-data refuses a web page in place of a data file", w)
+    w = [n for n, r in [("said its size", Canned(200, {"Content-Length": "2001"}, b"x" * 2001)),
+                        ("didn't say", Canned(200, {}, b"x" * 2001))]
+         if not refused("limit", start, opener=lambda u, r=r: r, limit=2000)]
+    try:
+        download(start, "/out/check", "check.csv", lambda u: Canned(200, {}, b"x" * 2000), limit=2000)
+    except Exception:
+        w.append("a file at the limit")
+    say(not w, "fetch-data stops downloads at the size limit", w)
+
+
+def self_check():
+    if not shutil.which("bwrap"):
+        say(False, "downloads run in a sandbox (install bubblewrap: sudo apt install bubblewrap)")
+        return 0
+    with Run() as work:
+        hosts = work / "hosts"
+        hosts.write_text("127.0.0.1 localhost\n10.9.8.7 check-private.example\n"
+                         "93.184.215.14 check-mixed.example\n10.9.8.7 check-mixed.example\n")
+        p = jail(Path(tempfile.mkdtemp(dir=work)), ["_self-check", str(Path.home()), str(ROOT)],
+                 network=True, extra=["--ro-bind", str(hosts), "/etc/hosts"])
+        lines = [l for l in getattr(p, "stdout", "").splitlines() if "\t" in l]
+        if not lines:
+            why = (getattr(p, "stderr", "") or "").strip().splitlines() or [str(p)]
+            say(False, f"downloads run in a sandbox ({why[-1][:200]})")
+            return 0
+        print("\n".join(lines))
+        fine = ["data.csv", "data.csv.gz", "table.xlsx", "survey.dta", "panel.parquet", "bundle.zip"]
+        w = [n for n in ["data.pkl", "model.pt", "frame.rds", "objects.RData", "objects.rda", "frame.pkl.gz",
+                         "model.joblib"] if not name_problem(n)] + [n for n in fine if name_problem(n)]
+        say(not w, "fetch-data refuses formats that run code when they're loaded", w)
+        w = [n for n in ["CLAUDE.md", "agents.md", "Claude.local.md", ".hidden.csv", "sub/data.csv", "../data.csv",
+                         "my data.csv", "wanted.txt", "fetched.tsv", "bundle.7z"] if not name_problem(n)]
+        say(not w, "fetch-data refuses names Claude Code loads as instructions, hidden names and paths", w)
+        # Archives made to unpack outside their folder, link out of it, plant instructions or a
+        # repository, or hold formats that run code when loaded.
+        files = {"escape.zip": ["../escape.csv"], "absolute.zip": ["/escape.csv"], "escape.tar": ["../../escape.csv"],
+                 "link.zip": [("link", "/etc/passwd")], "link.tar": [("home", str(Path.home()))],
+                 "hardlink.tar": [("passwd", "/etc/passwd", "hard")],
+                 "claude.zip": ["data/CLAUDE.md"], "agents.tar.gz": ["AGENTS.md"],
+                 "settings.zip": [".claude/settings.json"], "repo.tar": [".git/config"],
+                 "pickle.zip": ["model.pkl"], "rdata.tar": ["data/objects.RData"],
+                 "plain.zip": ["data.csv", "docs/readme.txt"], "plain.tar.gz": ["data.csv", "docs/readme.txt"]}
+        for name, members in files.items():
+            path = work / name
+            if name.endswith(".zip"):
+                with zipfile.ZipFile(path, "w") as z:
+                    for m in members:
+                        if isinstance(m, tuple):
+                            info = zipfile.ZipInfo(m[0])
+                            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                            z.writestr(info, m[1])
+                        else:
+                            z.writestr(m, "check\n")
+            else:
+                with tarfile.open(path, "w:gz" if name.endswith(".gz") else "w") as t:
+                    for m in members:
+                        info = tarfile.TarInfo(m[0] if isinstance(m, tuple) else m)
+                        if isinstance(m, tuple):
+                            info.type = tarfile.LNKTYPE if len(m) == 3 else tarfile.SYMTYPE
+                            info.linkname = m[1]
+                            t.addfile(info)
+                        else:
+                            info.size = 6
+                            t.addfile(info, io.BytesIO(b"check\n"))
+
+        def kept(name):
+            try:
+                check_file(work / name, name, work)
+            except Refused:
+                return False
+            return True
+        for check, group, keep in [
+                ("fetch-data refuses archives that would unpack outside their folder",
+                 ["escape.zip", "absolute.zip", "escape.tar"], False),
+                ("fetch-data refuses archives with links in them", ["link.zip", "link.tar", "hardlink.tar"], False),
+                ("fetch-data refuses archives holding files Claude Code loads as instructions, or a repository",
+                 ["claude.zip", "agents.tar.gz", "settings.zip", "repo.tar"], False),
+                ("fetch-data refuses archives holding formats that run code when they're loaded",
+                 ["pickle.zip", "rdata.tar"], False),
+                ("fetch-data keeps a plain archive", ["plain.zip", "plain.tar.gz"], True)]:
+            w = [n for n in group if kept(n) != keep]
+            say(not w, check, w)
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    command = args[0] if args else ""
+    if command.startswith("_"):
+        return jailed(command, args[1:])
+    if command == "self-check" and len(args) == 1:
+        return self_check()
+    if command == "add" and len(args) in (2, 3):
+        status = add(args[1], args[2] if len(args) == 3 else "")
+    elif command == "refresh" and len(args) >= 2:
+        status = refresh(args[1:])
+    elif args in ([], ["--yes"], ["-y"]):
+        status = fetch(ask=not args)
+    else:
+        start = __doc__.index("  ./fetch-data")
+        print("Usage:\n" + __doc__[start:__doc__.index("\n\n", start)], file=sys.stderr)
+        return 1
+    if changed:
+        make_copies()
+    return status
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

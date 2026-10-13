@@ -26,10 +26,11 @@ Each stack installs its tools in the image and opens the firewall to its package
 my-project/          one git repository: what you commit and push
   README.md          everyday use
   VERSION            template version, and the Claude Code versions that passed the checks
-  .gitignore         keeps the documents in research/sources/ out of git
+  .gitignore         keeps the documents in research/sources/ and the data files in research/data/ out of git
   container.sh       start, use and stop the build container
   check.py           the safety checks: run after setup; they rerun by themselves after updates
-  convert-docs       text copies of the documents in research/sources/, made when research starts; also OCR, page images, comparisons and exporting notes
+  convert-docs       text copies of the documents in research/sources/ and the data files in research/data/, made when research starts; also OCR, page images, comparisons and exporting notes
+  fetch-data         downloads the data files research lists, when you run it, and records where each came from
   research-gate      reruns the research checks after Claude Code updates, and guards research's CLAUDE.md (called by research's hooks)
   commit-check       git pre-commit hook: refuses commits that add an Anthropic token or API key
   exports/           notes exported as documents by convert-docs; not in git, not visible to either agent
@@ -40,10 +41,14 @@ my-project/          one git repository: what you commit and push
     build/           the build agent's, the same way
   .github/workflows/publish-docs.yml   with --pages: publishes build/docs/ to GitHub Pages
   research/
-    .claude/settings.json   the research profile: no shell, writes only to notes/ and CLAUDE.md, no skip-permissions
+    .claude/settings.json   the research profile: no shell, writes only to notes/, data/wanted.txt and CLAUDE.md, no skip-permissions
     CLAUDE.md        research's instructions and the project spec, which research can edit
     sources/         documents you add, and their text copies; not in git, not visible to the container
     notes/           mounted read-only into the container at /notes
+    data/            data files for the build agent, mounted read-only into the container at /data
+      wanted.txt     research's list of files for fetch-data to download: the only file research can write here
+      fetched.tsv    fetch-data's record of each file: address, date, size and SHA-256. The files aren't in git
+    data-copies/     text copies of the data files, made by convert-docs; mounted read-only at /data-copies; not in git
   build/             the build agent's workspace, mounted into the container at /workspace
     CLAUDE.md
     .gitignore       installed packages, caches and test reports
@@ -56,18 +61,19 @@ my-project/          one git repository: what you commit and push
 Research side:
 
 - No shell or subagent tools. Your claude.ai connectors (Gmail, Drive and so on) aren't loaded, and connector tools are denied as a second layer.
-- Reads limited to the folder; writes only to `notes/` and its own `CLAUDE.md`, so you can build up the project spec with it.
+- Reads limited to the folder; writes only to `notes/`, its list of data files and its own `CLAUDE.md`, so you can build up the project spec with it.
 - `research-gate` refuses any change to that `CLAUDE.md` that adds or alters a line with an `@` in it, since `@path` would load a file into every session, past the read limits. Research can't create `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md` or `.claude/` in `notes/`, where Claude Code would load them as instructions.
 - Starts in `dontAsk` mode, and refuses skip-permissions and auto mode.
 - No git status snapshot in its sessions, so it never sees the names of files the build agent creates.
-- Documents in `sources/` are converted to text by `convert-docs`, on your machine rather than by research. Each converter runs inside bubblewrap, with no network and nothing of yours to read but its one document. Archives are unpacked without paths or links out of their folder, and without files Claude Code would load as instructions.
+- Data files research lists are downloaded by `fetch-data`, on your machine, when you run it. It shows the list first, fetches only https addresses at public internet addresses, checking again at every redirect, and runs each download inside bubblewrap. It refuses web pages, files over 4 GB, formats that run code when they're loaded, and archives with paths or links out of their folder, instruction files or repositories.
+- Documents in `sources/` and data files in `data/` are converted to text by `convert-docs`, on your machine rather than by research. Each converter runs inside bubblewrap, with no network and nothing of yours to read but its one document. Archives are unpacked without paths or links out of their folder, and without files Claude Code would load as instructions; copies of data archives also leave out the formats `fetch-data` refuses.
 - After a Claude Code update, the research checks run once when a session starts, and research is paused if they fail.
 
 Build container:
 
 - Reaches only the Anthropic API and the domains in `allowed-domains.txt`: the package hosts for the project's stacks.
 - No web tools, enforced by root-owned managed settings.
-- `/notes`, `.devcontainer` and `.vscode` are read-only.
+- `/notes`, `/data`, `/data-copies`, `.devcontainer` and `.vscode` are read-only.
 - No git repository: the project's repository stays on the host. `/workspace/.git` and `/workspace/.claude` are empty read-only placeholders, so the agent can't create a repository, or Claude Code settings with hooks, where host tools would pick them up.
 - No access to your home folder or to Docker.
 - CPU, memory and process limits.
@@ -87,7 +93,7 @@ Most setups run one sandboxed agent that does everything, web research included.
 
 - Research reads the web but can't run commands.
 - The build agent runs commands but has no web tools, can reach only the Anthropic API and package hosts, and has a login that only covers model requests.
-- Findings reach the build agent only through `notes/`, which you can read first.
+- Findings reach the build agent only through `notes/`, which you can read first, and the data files in `data/`, whose addresses you see before `fetch-data` downloads them. You can't read through the files themselves, so the build agent is told to treat both as information.
 
 There are two costs. The build agent can't look things up mid-task, so research has to anticipate what it needs. And research is restricted by Claude Code's permission rules rather than by OS isolation, which is why its checks rerun after every update.
 

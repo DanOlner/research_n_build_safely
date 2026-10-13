@@ -1,9 +1,9 @@
 #!/bin/bash
-# Make text copies of the documents in research/sources/, so research sessions can search them and
-# re-read them cheaply. Research's SessionStart hook runs this, so documents you add are copied
-# when the next research session starts. You can also run it yourself, in this folder:
+# Make text copies of the documents in research/sources/, beside them, and of the data files in
+# research/data/, in research/data-copies/, so research can search them and re-read them cheaply.
+# Research's SessionStart hook runs this, and fetch-data does after downloading. Or, in this folder:
 #
-#   ./convert-docs                      copy every new or changed document in research/sources/
+#   ./convert-docs                      copy every new or changed document and data file
 #   ./convert-docs FILE|FOLDER ...      only these
 #   ./convert-docs ocr PDF ...          redo PDFs' text copies, reading scanned pages with OCR
 #   ./convert-docs pages PDF PAGES      images of PDF pages in two halves, for small print
@@ -12,8 +12,14 @@
 #   ./convert-docs export NOTE ... [--to docx|odt|pdf|html]    notes as documents, in exports/
 #
 # Documents can be named from this folder (research/sources/report.pdf) or from research/sources/
-# (report.pdf), and notes from research/notes/. "Working with documents" in the README lists what
-# each command makes and the packages it needs.
+# (report.pdf), and notes from research/notes/. Data files, named the same ways, are only copied:
+# the other commands are for documents. "Working with documents" in the README lists what each
+# command makes and the packages it needs.
+#
+# The build container reads research/data/ at /data and research/data-copies/ at /data-copies, both
+# read-only. So /data holds only files as published, and the copies of data archives leave out the
+# formats fetch-data refuses. research/data-copies/ is all made here: a copy whose data file has
+# gone is removed.
 #
 # Every converter runs inside bubblewrap (sudo apt install bubblewrap), with no network, a folder
 # of its own to write in, and nothing of yours to read but the one document it's converting.
@@ -28,6 +34,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SOURCES="$(cd "$ROOT/research/sources" 2>/dev/null && pwd -P)" || SOURCES="$ROOT/research/sources"
 NOTES="$(cd "$ROOT/research/notes" 2>/dev/null && pwd -P)" || NOTES="$ROOT/research/notes"
+DATA="$(cd "$ROOT/research/data" 2>/dev/null && pwd -P)" || DATA="$ROOT/research/data"
+COPIES="$(cd "$ROOT/research/data-copies" 2>/dev/null && pwd -P)" || COPIES="$ROOT/research/data-copies"
 EXPORTS="$ROOT/exports"
 LIMIT=900          # seconds a converter may run
 HOOK_LIMIT=140     # the same, when research's SessionStart hook runs this
@@ -146,15 +154,22 @@ kind() {
     *.xlsx|*.xlsm|*.xls|*.ods) echo sheets ;;
     *.zip) echo zip ;;
     *.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz) echo tar ;;
+    *.gz|*.bz2|*.xz) echo compressed ;;
   esac
 }
-copy_of() {  # FILE KIND: where its copy goes
+copy_of() {  # FILE KIND: where its copy goes: beside it, or for a data file, in research/data-copies/
+  local f="$1"
+  case "$f" in "$DATA"/*) f="$COPIES/${f#"$DATA"/}" ;; esac
   case "$2" in
-    pdf|slides) echo "$1.txt" ;;
-    pandoc|doc) echo "$1.md" ;;
-    sheets) echo "$1.sheets" ;;
-    zip|tar) echo "$1.files" ;;
+    pdf|slides) echo "$f.txt" ;;
+    pandoc|doc) echo "$f.md" ;;
+    sheets) echo "$f.sheets" ;;
+    zip|tar|compressed) echo "$f.files" ;;
   esac
+}
+for_data() {  # FILE: whether it's a data file, or in a data file's copy, which the build agent reads
+  case "$1" in "$DATA"/*|"$COPIES"/*) return 0 ;; esac
+  return 1
 }
 tools_for() {
   case "$1" in
@@ -163,7 +178,7 @@ tools_for() {
     doc) echo soffice pandoc ;;
     slides) echo soffice pdftotext ;;
     sheets) echo soffice ;;
-    zip|tar) echo python3 ;;
+    zip|tar|compressed) echo python3 ;;
   esac
 }
 
@@ -215,7 +230,7 @@ copy_pdf() {  # SRC DEST [ocr]
   detail=" ($pages page$([ "$pages" -eq 1 ] || echo s)"
   if [ "$empty" -gt 0 ] && [ "${3-}" != ocr ]; then
     detail+=", $empty with little or no text: blank or scanned"
-    scanned+=("$1")
+    for_data "$1" || scanned+=("$1")   # ocr is for documents
   fi
   detail+=")"
 }
@@ -273,15 +288,23 @@ copy_sheets() {  # SRC DEST: one CSV per sheet, values as displayed
 
 # Unpacks an archive inside the sandbox. No paths outside the folder, no links out of it, and no
 # CLAUDE.md, CLAUDE.local.md, AGENTS.md or .claude/, which Claude Code would load as instructions
-# when research reads files near them, or .git/, a repository git would act on.
+# when research reads files near them, or .git/, a repository git would act on. For data files,
+# which the build agent reads, also none of the formats fetch-data refuses: those that run code
+# when they're loaded, and archives it can't look inside. Compressed files are decompressed the
+# same way.
 read -r -d '' UNPACK <<'PY'
-import os, sys, tarfile, zipfile
-kind, src, dest = sys.argv[1:4]
+import bz2, gzip, lzma, os, sys, tarfile, zipfile
+kind, src, dest, where = sys.argv[1:5]
 MAX_BYTES, MAX_FILES = 4 * 1024**3, 50000
 LEFT_OUT = {"claude.md", "claude.local.md", "agents.md", ".claude", ".git"}
+NOT_FOR_DATA = {".pkl", ".pickle", ".joblib", ".dill", ".pt", ".pth", ".ckpt", ".rds", ".rda", ".rdata",
+                ".7z", ".rar"}
 
 def left_out(name):
-    return any(p.lower() in LEFT_OUT for p in name.replace("\\", "/").split("/"))
+    parts = [p.lower() for p in name.replace("\\", "/").split("/")]
+    if any(p in LEFT_OUT for p in parts):
+        return True
+    return where == "data" and any("." + s in NOT_FOR_DATA for s in parts[-1].split(".")[1:])
 
 def too_big(sizes):
     if len(sizes) > MAX_FILES or sum(sizes) > MAX_BYTES:
@@ -300,7 +323,20 @@ def keep(member, path):
 
 os.makedirs(dest)
 try:
-    if kind == "zip":
+    if kind == "compressed":
+        name = sys.argv[5]
+        if left_out(name):
+            print(name)
+            sys.exit(0)
+        total = 0
+        opener = {"gz": gzip.open, "bz2": bz2.open, "xz": lzma.open}[src.rsplit(".", 1)[1]]
+        with opener(src) as f, open(os.path.join(dest, name), "wb") as out:
+            while chunk := f.read(1 << 20):
+                total += len(chunk)
+                if total > MAX_BYTES:
+                    sys.exit(f"would decompress to more than {MAX_BYTES / 1e9:.0f} GB")
+                out.write(chunk)
+    elif kind == "zip":
         with zipfile.ZipFile(src) as z:
             members = z.infolist()
             too_big([m.file_size for m in members])
@@ -319,10 +355,16 @@ except Exception as e:
 PY
 
 copy_archive() {  # SRC DEST KIND
-  local o n left
+  local o n left where=sources ext="$3" inner=()
+  for_data "$1" && where=data
+  if [ "$3" = compressed ]; then
+    ext="${1##*.}"
+    ext="${ext,,}"
+    inner=("$(basename -- "${1%.*}")")   # what it decompresses to: its name without the ending
+  fi
   o="$(fresh)"
-  jail "$o" "$1" "source.$3" -- python3 -I -c "$UNPACK" "$3" "/in/source.$3" /out/files \
-    >"$o/left-out" || return 1
+  jail "$o" "$1" "source.$ext" -- python3 -I -c "$UNPACK" "$3" "/in/source.$ext" /out/files "$where" \
+    "${inner[@]}" >"$o/left-out" || return 1
   n="$(find "$o/files" -type f | wc -l)"
   touch "$o/files"  # unpacking can give it the archive's date, so it would look out of date
   replace "$o/files" "$2" || return 1
@@ -335,6 +377,7 @@ copy_archive() {  # SRC DEST KIND
 }
 copy_zip() { copy_archive "$1" "$2" zip; }
 copy_tar() { copy_archive "$1" "$2" tar; }
+copy_compressed() { copy_archive "$1" "$2" compressed; }
 
 converted=0 current=0 failed=0 skipped=0 later=0
 declare -A seen
@@ -359,6 +402,7 @@ convert_one() {  # SRC [force]: copy SRC if its copy is missing or older than it
     return 0
   fi
   sandbox_ready || { skipped=$((skipped + 1)); return 0; }
+  mkdir -p -- "$(dirname -- "$dest")" || return 0
   detail=""
   : >"$work/log"
   if "copy_$k" "$src" "$dest"; then
@@ -391,30 +435,64 @@ resolve() {
   return 1
 }
 
-# Folders where Claude Code would load instructions: warn about any the user put in sources/.
+# Folders where Claude Code would load instructions: warn about any the user put in sources/, or
+# in research/data/, where fetch-data refuses them but files put there by hand aren't checked.
 instructions() {
   local f
   while IFS= read -r -d '' f; do
     say "Warning    $(rel "$f") would be loaded as instructions when research reads files near it: rename or remove it"
-  done < <(find "$SOURCES" \( -iname CLAUDE.md -o -iname CLAUDE.local.md -o -iname AGENTS.md \
-                              -o -name .claude \) -print0 2>/dev/null)
+  done < <(find "$SOURCES" "$DATA" \( -iname CLAUDE.md -o -iname CLAUDE.local.md \
+                              -o -iname AGENTS.md -o -name .claude \) -print0 2>/dev/null)
+}
+
+# A document in research/sources/, or a data file in research/data/.
+resolve_doc() {
+  resolve "$1" "$SOURCES" 2>/dev/null || resolve "$1" "$DATA" 2>/dev/null ||
+    { echo "Not in $(rel "$SOURCES")/ or $(rel "$DATA")/: $1" >&2; return 1; }
+}
+
+# Remove what's in research/data-copies/ that isn't the copy of a file in research/data/, now that
+# the file has gone or changed kind. Everything there is made by this script.
+prune_copies() {
+  [ -d "$COPIES" ] && [ -d "$DATA" ] || return 0
+  local f k c p
+  local -A keep=()
+  while IFS= read -r -d '' f; do
+    k="$(kind "$f")"
+    [ -n "$k" ] || continue
+    c="$(copy_of "$f" "$k")"
+    while [ "$c" != "$COPIES" ] && [ -z "${keep[$c]-}" ]; do keep[$c]=1; c="$(dirname -- "$c")"; done
+  done < <(find "$DATA" \( -type f -o -type l \) -print0 2>/dev/null)
+  # Copies aren't looked inside: what's in one is remade with it.
+  while IFS= read -r -d '' p; do
+    [ -n "${keep[$p]-}" ] || [ "$p" = "$COPIES/.gitkeep" ] && continue
+    [ -e "$p" ] || [ -L "$p" ] || continue   # in a folder removed already
+    rm -rf -- "$p" && say "Removed    $(rel "$p"): its data file has gone"
+  done < <(find "$COPIES" -mindepth 1 \( -type d \( -name '*.files' -o -name '*.sheets' \) -prune -print0 \) -o -print0)
 }
 
 convert_all() {  # [FILE|FOLDER]...
-  local roots=() a f round before
-  for a in "$@"; do roots+=("$(resolve "$a" "$SOURCES")") || exit 1; done
-  [ ${#roots[@]} -gt 0 ] || roots=("$SOURCES")
+  local roots=() named=() a f round before whole=false
+  for a in "$@"; do roots+=("$(resolve_doc "$a")") || exit 1; done
+  [ ${#roots[@]} -gt 0 ] || roots=("$SOURCES" "$DATA")
+  named=("${roots[@]}")
   [ -d "$SOURCES" ] || { say "No folder $(rel "$SOURCES")"; return 1; }
-  scan() { find "${roots[@]}" \( -type f -o -type l \) -print0 2>/dev/null | sort -z; }
+  # Documents in a data file's copy, such as an unpacked archive, are copied where they are.
+  for a in "${named[@]}"; do
+    [ "$a" != "$DATA" ] || whole=true
+    case "$a/" in "$DATA"/*) roots+=("$COPIES") ;; esac
+  done
+  scan() { find "${roots[@]}" \( -type f -o -type l \) -print0 2>/dev/null | sort -zu; }
   # Archives first, so their documents are copied in the same run; archives in archives too.
   for round in 1 2 3; do
     before=$converted
     while IFS= read -r -d '' f; do
-      case "$(kind "$f")" in zip|tar) convert_one "$f" ;; esac
+      case "$(kind "$f")" in zip|tar|compressed) convert_one "$f" ;; esac
     done < <(scan)
     [ "$converted" -gt "$before" ] || break
   done
   while IFS= read -r -d '' f; do convert_one "$f"; done < <(scan)
+  [ "$whole" = false ] || prune_copies
   instructions
   if [ "${#scanned[@]}" -gt 0 ]; then
     say "To read scanned pages with OCR: ./convert-docs ocr$(printf ' "%s"' "${scanned[@]#"$SOURCES"/}")"
@@ -422,7 +500,7 @@ convert_all() {  # [FILE|FOLDER]...
   [ "$later" -eq 0 ] || say "$later more to convert: run ./convert-docs in the project folder, or start research again"
   if [ "$hook" = false ]; then
     if [ $((converted + current + failed + skipped)) -eq 0 ]; then
-      echo "No documents in $(rel "${roots[0]}")/"
+      echo "Nothing to copy in $(rel "${named[0]}")/$([ ${#named[@]} -lt 2 ] || echo " or $(rel "${named[1]}")/")"
     else
       echo "$converted converted, $current already up to date, $failed failed, $skipped skipped"
     fi
@@ -649,7 +727,7 @@ status=$?
 # The hook's message, shown when a research session starts, only when there's something to say.
 if [ "$hook" = true ] && [ ${#report[@]} -gt 0 ]; then
   {
-    echo "convert-docs, for the documents in research/sources/:"
+    echo "convert-docs, for research/sources/ and research/data/:"
     printf '  %s\n' "${report[@]:0:12}"
     [ ${#report[@]} -le 12 ] || echo "  and $(( ${#report[@]} - 12 )) more: run ./convert-docs to see them"
   } | python3 -c 'import json, sys; print(json.dumps({"systemMessage": sys.stdin.read().rstrip()}))'

@@ -5,6 +5,15 @@
 /research/sources/*
 !/research/sources/.gitkeep
 
+# Data files for the build agent: often big, sometimes under licences that don't allow sharing them,
+# and downloadable again with ./fetch-data from the record in fetched.tsv, which is kept, as is
+# research's list. Their text copies are made again by convert-docs.
+/research/data/*
+!/research/data/wanted.txt
+!/research/data/fetched.tsv
+/research/data-copies/*
+!/research/data-copies/.gitkeep
+
 # Claude Code's personal settings, if any get created.
 /research/.claude/settings.local.json
 
@@ -16,3 +25,6 @@
 # convert-docs: notes exported as documents, and its lock and working folders.
 /exports/
 /.convert-docs.*
+
+# fetch-data's lock and working folders.
+/.fetch-data.*

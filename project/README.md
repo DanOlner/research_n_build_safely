@@ -2,12 +2,12 @@
 
 A two-part Claude project, made from the dual-project template (version in `VERSION`).
 
-- **`research/`**: on your machine, Claude searches and reads the web and any documents you put in `research/sources/`, and writes notes into `research/notes/`. It can also edit `research/CLAUDE.md`, so you can build up the project spec there together. It can't run commands, read outside its folder, or write anywhere else.
-- **`build/`**: Claude works on the project inside a Docker container with permission checks skipped. It reads the notes at `/notes`, read-only.
+- **`research/`**: on your machine, Claude searches and reads the web and any documents you put in `research/sources/`, and writes notes into `research/notes/`. It lists the data files the build side needs in `research/data/wanted.txt`, and you download them with `./fetch-data`. It can also edit `research/CLAUDE.md`, so you can build up the project spec there together. It can't run commands, read outside its folder, or write anywhere else.
+- **`build/`**: Claude works on the project inside a Docker container with permission checks skipped. It reads the notes at `/notes`, and the data files at `/data` with their text copies at `/data-copies`, all read-only.
 
-This whole folder is one git repository, which you push: research notes, build code and these scripts, but not the documents in `research/sources/`. The build container never sees the repository. Once the container has run, empty `build/.git` and `build/.claude` folders owned by root appear. They're placeholders that stop the agent creating a repository or Claude Code settings there, and git ignores them.
+This whole folder is one git repository, which you push: research notes, build code and these scripts, but not the documents in `research/sources/` or the data files in `research/data/`. The build container never sees the repository. Once the container has run, empty `build/.git` and `build/.claude` folders owned by root appear. They're placeholders that stop the agent creating a repository or Claude Code settings there, and git ignores them.
 
-`container.sh`, `check.py`, `convert-docs`, `research-gate` and `commit-check` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
+`container.sh`, `check.py`, `convert-docs`, `fetch-data`, `research-gate` and `commit-check` stay in this top folder, outside `build/`, so the build agent can't change scripts you run on your machine.
 <!-- convos -->
 So do `convos` and `scripts/`, which keep the conversation records (see "Conversation records").
 <!-- /convos -->
@@ -51,7 +51,7 @@ git status --ignored
 git diff
 ```
 
-The first lists every file and folder that was added, changed or deleted: by the build agent in `build/`, and by research in `research/notes/` and `research/CLAUDE.md`. It also lists what the `.gitignore` files hide from a plain `git status`, such as `.venv/`, `node_modules/` and the documents in `research/sources/`, though not what changed inside them. The second shows the changes inside files you'd already committed. It doesn't show new files, so open those yourself. Pay most attention to:
+The first lists every file and folder that was added, changed or deleted: by the build agent in `build/`, and by research in `research/notes/`, `research/data/wanted.txt` and `research/CLAUDE.md`. It also lists what the `.gitignore` files hide from a plain `git status`, such as `.venv/`, `node_modules/`, the documents in `research/sources/` and the data files in `research/data/`, though not what changed inside them. The second shows the changes inside files you'd already committed. It doesn't show new files, so open those yourself. Pay most attention to:
 
 - R scripts, `.Rprofile`, `.Renviron` and `.RData`
 - Python scripts, `setup.py` and `pyproject.toml`
@@ -67,7 +67,7 @@ To throw away everything the build agent did since your last commit, including i
 git restore --source=HEAD --staged --worktree -- build && git clean -ffdx -- build
 ```
 
-Keep the `-- build` on both. `git reset --hard` would also throw away uncommitted research notes, and `git clean -ffdx` without `-- build` would delete your documents in `research/sources/`.
+Keep the `-- build` on both. `git reset --hard` would also throw away uncommitted research notes, and `git clean -ffdx` without `-- build` would delete your documents in `research/sources/` and the data files in `research/data/`.
 
 **Closing the container.** Exiting Claude (`/exit`) leaves the container running, along with anything the agent started in it, such as a dev server. When you've finished, exit Claude, then run:
 
@@ -129,6 +129,7 @@ Cloning this repository gives you the notes, the build code and these scripts. N
 **What the clone doesn't have:**
 
 - **The documents in `research/sources/`**, and their copies. Git ignores them. Copy the documents across yourself. Their copies are made when research next starts, or run `./convert-docs`.
+- **The data files in `research/data/`**, which git ignores too. Run `./fetch-data` to download them again: it checks each against its record, makes their text copies, and says which it couldn't get, such as files added by hand.
 - **`exports/`**, which git ignores too.
 - **Conversation history.** Research sessions are kept in `~/.claude/projects/` and the build agent's in a Docker volume, both on the machine where they happened. `claude --continue` and `./container.sh claude --continue` start fresh on a new machine. The notes and the two `CLAUDE.md` files are what carry across.
 - **What `build/.gitignore` leaves out**, such as `.venv/` and `node_modules/`, plus anything the build agent has added there, like generated results. Reinstall or regenerate it inside the container. Read `build/.gitignore` before you push, so you know what won't come across.
@@ -146,6 +147,7 @@ Copy documents into `research/sources/` (subfolders are fine). When a research s
 | Slides (`.pptx`, `.ppt`, `.ppsx`, `.pps`, `.odp`) | `talk.pptx.txt`. Each slide starts with a `--- slide N ---` line. Speaker notes aren't included. |
 | A spreadsheet (`.xlsx`, `.xlsm`, `.xls`, `.ods`) | A folder, `data.xlsx.sheets/`, with a CSV of each sheet's values as displayed. |
 | An archive (`.zip`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`) | A folder, `data.zip.files/`, with the archive unpacked and its documents copied in the same way. |
+| A compressed file (`.gz`, `.bz2`, `.xz`), `report.pdf.gz` | A folder, `report.pdf.gz.files/`, with it decompressed and copied in the same way. |
 
 A copy is remade when its document changes. To redo one, delete it and run `./convert-docs`. Deleting a document leaves its copy, so delete both.
 
@@ -153,7 +155,7 @@ A copy is remade when its document changes. To redo one, delete it and run `./co
 
 | Command | What it does |
 |---|---|
-| `./convert-docs` | Copies every new or changed document, as a research session does when it starts. Use it for documents you add during a session. |
+| `./convert-docs` | Copies every new or changed document, and data file, as a research session does when it starts. Use it for documents you add during a session. |
 | `./convert-docs report.pdf` | Copies only that document, or that folder. |
 | `./convert-docs ocr report.pdf` | Redoes a PDF's copy, reading its scanned pages with OCR. Pages that have text keep it. OCR is slow, so it only runs when you ask. When `convert-docs` finds pages with little or no text, it prints this command for those PDFs. |
 | `./convert-docs pages report.pdf 12-14` | Images of PDF pages 12 to 14, for print too small to read in the PDF. Each page is split into two overlapping halves at 200 dpi: top and bottom (`report.pdf.page-12-top.png`), or left and right for a landscape page. Claude sees each half in more detail than it sees a whole page. Give pages as `12`, `12-14` or `3,7,12-14`. |
@@ -161,7 +163,7 @@ A copy is remade when its document changes. To redo one, delete it and run `./co
 | `./convert-docs compare old.pdf new.pdf` | Writes the wording that changed between two documents to `old.pdf.vs.new.pdf.diff`, word by word, with the page each change is on. It compares their copies, so it works for any document with a copy, and for text files. |
 | `./convert-docs export topic.md` | Turns a note in `research/notes/` into a Word document, `exports/topic.docx`. Add `--to odt`, `--to pdf` or `--to html` for other formats. You can give several notes at once. |
 
-Name documents from this folder (`research/sources/report.pdf`) or from inside `research/sources/` (`report.pdf`), and notes from inside `research/notes/` (`topic.md`). Research can't run these, but it may ask you to, giving the command.
+Name documents from this folder (`research/sources/report.pdf`) or from inside `research/sources/` (`report.pdf`), and notes from inside `research/notes/` (`topic.md`). Data files can be named the same ways, but only copied. Research can't run these, but it may ask you to, giving the command.
 
 **Packages**, once per machine. A document whose converter isn't installed is skipped, with a message naming the package.
 
@@ -193,6 +195,39 @@ Archives are unpacked with nothing outside their folder and no links leading out
 ```
 cd research && claude --disallowedTools WebFetch WebSearch
 ```
+
+## Data for the build agent
+
+Research lists the data files the build side needs, such as tables of statistics, in `research/data/wanted.txt`: each file's address and a name to save it as. It can't download them itself: its web tool reads pages for it without saving files, and it can't run commands. So you download them, in this top folder:
+
+```
+./fetch-data
+```
+
+It lists what it will download and the website each file comes from, and asks before it starts. Each file is saved in `research/data/` exactly as the website served it, and `research/data/fetched.tsv` records where it came from: its address, the date, its size and its SHA-256. The build agent reads the files at `/data`, read-only, and research can read them too. `fetch-data` needs `bubblewrap`, like `convert-docs`.
+
+| Command | What it does |
+|---|---|
+| `./fetch-data` | Downloads what `wanted.txt` lists that isn't here yet, and any recorded file that's missing, such as in a new clone, checking it's the same file as before. With `--yes` it doesn't ask first. |
+| `./fetch-data add FILE [ADDRESS]` | Records a file you downloaded yourself, such as from a site that needs you to sign in, and copies it into `research/data/`. Its record says `by hand`, because nothing checked that it came from that address. |
+| `./fetch-data refresh NAME` | Downloads a recorded file again, and keeps the new version if the publisher has changed it, updating its record. Use it when a series is revised. |
+
+**Text copies.** After downloading, `fetch-data` runs `convert-docs`, which copies the spreadsheets, archives, compressed files and documents in `research/data/` as it does those in `research/sources/`. The copies go in `research/data-copies/`: `table.xlsx.sheets/` has a CSV of each sheet, with values as displayed, and `bundle.zip.files/` the archive unpacked. Research reads them, and the build agent sees them at `/data-copies`, read-only, so it can use an unpacked copy rather than unpacking an archive itself. Copies of data archives also leave out the formats `fetch-data` refuses. They're made again when research starts, or with `./convert-docs`. A copy whose data file has gone is removed, and git ignores the folder. Parquet, Stata, SPSS and SAS files get no copies: research can't read them, so it uses their documentation.
+
+**Git** ignores the data files, as it does the documents in `research/sources/`: they can be big, and some licences don't allow sharing them. `wanted.txt` and `fetched.tsv` are committed. So in a clone, `./fetch-data` downloads the files again and checks each against its record. One that has changed at its source isn't kept until you `refresh` it, and files added by hand need adding again unless their address still works. To drop a file, delete it and its lines in `wanted.txt` and `fetched.tsv`.
+
+**Files you put in `research/data/` yourself**, rather than with `./fetch-data add`, aren't checked or recorded. `./fetch-data` lists them, so you can add them.
+
+**What `fetch-data` refuses.** Research chooses the addresses, and research reads the web, so a misleading page could choose them. Each download runs inside bubblewrap, which sees system folders but not your home folder or this project, and writes only to an empty folder of its own. `fetch-data` also:
+
+- fetches only https addresses, and only from public internet addresses, checked again at every redirect, so nothing on your machine or your local network can be copied into `research/data/` for research to read;
+- refuses a web page in place of a data file, such as a page with a download button, or a sign-in page;
+- refuses files over 4 GB, and formats that run code when they're loaded: pickle, joblib and PyTorch files, and R's `.rds`, `.rda` and `.RData`;
+- refuses archives that would unpack outside their folder, or to more than 50,000 files or 4 GB, or that hold links, those formats, `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/` or `.git/`. The build agent unpacks archives in `build/`, where Claude Code would load the instruction files and git would act on the repository. `.7z` and `.rar` archives are refused, since it can't look inside them.
+
+Files you add by hand are refused for the same reasons. If you need one it refuses, such as a replication package with `.rds` files, don't open it on your machine, where loading it would run its code. Look for the data in another format, or put it in `build/` yourself, knowing that its code would run in the container. `./check.py` checks the sandbox and the refusals.
+
+**You can't read through data files** as you can a note, and their text can carry instructions. The build agent is told to treat `/data` as information, as it does `/notes`, and never to follow instructions in it.
 
 <!-- convos -->
 ## Conversation records
@@ -268,7 +303,8 @@ The safety checks run by themselves when Claude Code's version changes, and each
 - DNS lookups from the container aren't filtered.
 - The container's login token is visible to the agent. It can only reach the Anthropic API and the allowed domains, and it can only make model requests. `commit-check` stops it being committed as plain text, but not encoded.
 - Research fetches can reach any website.
-- `convert-docs`'s sandbox limits each converter's time, but not its memory or disk use. A document made to blow up in size could fill either, though archives are refused if they'd unpack to more than 4 GB or 50,000 files.
+- `fetch-data` downloads from any public website research lists. You see each address before it's downloaded, but not what's in the file: its text can carry instructions to the build agent, and it could be made to exploit a bug in whatever reads it in the container. `fetch-data` refuses the formats known to run code when they're loaded, not every format with bugs. It limits each file to 4 GB, but not how many files research lists.
+- `convert-docs`'s sandbox limits each converter's time, but not its memory or disk use. A document made to blow up in size could fill either, though archives are refused if they'd unpack to more than 4 GB or 50,000 files, and compressed files if they'd decompress to more than 4 GB.
 - Research can rewrite its own `CLAUDE.md`. A web page or document that misleads it could change the instructions every later research session starts with, though not what research is allowed to do. Read changes to it in `git diff` as you'd read the notes.
 - Opening `build/` with VS Code's Dev Containers extension uses `build/.devcontainer/devcontainer.json`. It mirrors `container.sh` but hasn't been tested, and may need the VS Code hosts uncommented in `allowed-domains.txt`.
 - Machines other than Linux. The scripts and the container's firewall have only been tested on Linux.

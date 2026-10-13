@@ -110,9 +110,10 @@ start() {
     docker rm -f "$NAME" >/dev/null
   fi
   [ -f "$TOKEN_FILE" ] || { echo "Missing $TOKEN_FILE. See 'Container login' in README.md." >&2; exit 1; }
-  for d in research/notes build/.devcontainer build/.vscode; do
+  for d in research/notes research/data build/.devcontainer build/.vscode; do
     [ -d "$ROOT/$d" ] || { echo "Missing $ROOT/$d" >&2; exit 1; }
   done
+  mkdir -p "$ROOT/research/data-copies"   # convert-docs makes everything in it, so it can be deleted
   docker image inspect "$IMAGE" >/dev/null 2>&1 || build
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   local ports=() p
@@ -133,6 +134,8 @@ start() {
     -e CLAUDE_CONFIG_DIR=/home/node/.claude \
     --mount type=bind,source="$ROOT/build",target=/workspace \
     --mount type=bind,source="$ROOT/research/notes",target=/notes,readonly \
+    --mount type=bind,source="$ROOT/research/data",target=/data,readonly \
+    --mount type=bind,source="$ROOT/research/data-copies",target=/data-copies,readonly \
     --mount type=tmpfs,target=/workspace/.git,readonly \
     --mount type=tmpfs,target=/workspace/.claude,readonly \
     --mount type=bind,source="$ROOT/build/.devcontainer",target=/workspace/.devcontainer,readonly \

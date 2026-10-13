@@ -10,6 +10,7 @@
       "WebSearch",
       "WebFetch",
       "Edit(/notes/**)",
+      "Edit(/data/wanted.txt)",
       "Edit(/CLAUDE.md)"
     ],
     "deny": [
